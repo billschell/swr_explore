@@ -33,18 +33,24 @@ Controls:
     Toolbar Min SWR      – open per-band minimum SWR comparison table
 """
 
-import sys
-import os
+from __future__ import annotations
+
+import dataclasses
 import math
+import os
 import signal
-import numpy as np
+import sys
+
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-from matplotlib.widgets import Button
+import numpy as np
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch
+from matplotlib.widgets import Button
 
 # ── Band data (freq only; colours live in _BAND_COLORS) ──────────────────────
 BANDS = [
@@ -84,8 +90,10 @@ _BAND_COLORS = {
     ],
 }
 
-SWR_CAP = 50
-IMP_CAP = 2000
+SWR_CAP   = 50
+IMP_CAP   = 2000
+# Minimum visible frequency span (MHz).  Keeps major X ticks at ≥ 0.001 MHz.
+MIN_XSPAN = 0.005
 
 # Medium-saturation data colours that read clearly on both light and dark.
 COLORS = ['#e53935', '#1e88e5', '#43a047', '#fb8c00',
@@ -139,8 +147,37 @@ THEMES = {
 }
 
 
-# ── S1P parser ────────────────────────────────────────────────────────────────
-def parse_s1p(path):
+# ── Data container ────────────────────────────────────────────────────────────
+
+@dataclasses.dataclass
+class S1PDataset:
+    """Parsed contents of one .s1p Touchstone file.
+
+    Attributes:
+        label: Short display name derived from the filename.
+        freqs: Frequency array in MHz.
+        swrs:  SWR array, clipped to SWR_CAP.
+        rs:    Resistance (real part of Z) in ohms, clipped to ±IMP_CAP.
+        xs:    Reactance (imaginary part of Z) in ohms, clipped to ±IMP_CAP.
+    """
+    label: str
+    freqs: np.ndarray
+    swrs:  np.ndarray
+    rs:    np.ndarray
+    xs:    np.ndarray
+
+
+# ── Pure module-level functions ───────────────────────────────────────────────
+
+def parse_s1p(path: str) -> S1PDataset:
+    """Parse a Touchstone .s1p file and return an S1PDataset.
+
+    Supports RI, MA, and DB formats.  The reference impedance is read from
+    the ``#`` header line; any value other than 50 Ω is handled correctly.
+
+    Raises:
+        OSError: If the file cannot be opened.
+    """
     freqs, swrs, R_vals, X_vals = [], [], [], []
     fmt = "RI"
     z0  = 50.0
@@ -186,11 +223,24 @@ def parse_s1p(path):
             swrs.append(min(swr, SWR_CAP))
             R_vals.append(float(np.clip(Zr, -IMP_CAP, IMP_CAP)))
             X_vals.append(float(np.clip(Zi, -IMP_CAP, IMP_CAP)))
-    return (np.array(freqs), np.array(swrs),
-            np.array(R_vals), np.array(X_vals))
+    return S1PDataset(
+        label=os.path.basename(path),
+        freqs=np.array(freqs),
+        swrs=np.array(swrs),
+        rs=np.array(R_vals),
+        xs=np.array(X_vals),
+    )
 
 
-def find_band_minima(freqs, swrs):
+def find_band_minima(
+    freqs: np.ndarray, swrs: np.ndarray
+) -> list[tuple[str, float, float]]:
+    """Return the minimum SWR point within each ham band.
+
+    Returns:
+        List of ``(band_name, frequency_MHz, swr)`` tuples, one per band
+        that has at least one data point.
+    """
     results = []
     for name, flo, fhi in BANDS:
         mask = (freqs >= flo) & (freqs <= fhi)
@@ -203,18 +253,20 @@ def find_band_minima(freqs, swrs):
     return results
 
 
-def band_of(fx):
+def band_of(fx: float) -> str:
+    """Return a bracketed band name for *fx* MHz, or an empty string."""
     for name, flo, fhi in BANDS:
         if flo <= fx <= fhi:
             return f"  [{name}]"
     return ""
 
 
-def tip_text(ds, idx):
-    fx  = float(ds['freqs'][idx])
-    sy  = float(ds['swrs'][idx])
-    Rv  = float(ds['R'][idx])
-    Xv  = float(ds['X'][idx])
+def _format_tip(ds: S1PDataset, idx: int) -> str:
+    """Format the hover/pin tooltip text for dataset *ds* at sample *idx*."""
+    fx      = float(ds.freqs[idx])
+    sy      = float(ds.swrs[idx])
+    Rv      = float(ds.rs[idx])
+    Xv      = float(ds.xs[idx])
     swr_s   = f">{SWR_CAP}" if sy >= SWR_CAP else f"{sy:.2f}"
     sign    = '+' if Xv >= 0 else ''
     clipped = "  (clipped)" if abs(Rv) >= IMP_CAP or abs(Xv) >= IMP_CAP else ""
@@ -223,266 +275,427 @@ def tip_text(ds, idx):
             f"Z = {Rv:.1f}{sign}{Xv:.1f}j Ω{clipped}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    args = sys.argv[1:]
-    if not args or '--help' in args:
-        print(__doc__)
-        sys.exit(0 if '--help' in args else 1)
+# ── ThemeManager ──────────────────────────────────────────────────────────────
 
-    datasets = []
-    for path in args:
-        if not os.path.exists(path):
-            print(f"Warning: {path} not found – skipped")
-            continue
-        freqs, swrs, R, X = parse_s1p(path)
-        if len(freqs) == 0:
-            print(f"Warning: no data in {path} – skipped")
-            continue
-        datasets.append(dict(label=os.path.basename(path),
-                             freqs=freqs, swrs=swrs, R=R, X=X))
-    if not datasets:
-        print("No valid files loaded.")
-        sys.exit(1)
+class ThemeManager:
+    """Owns the active colour theme and applies it to all registered artists.
 
-    # ── Theme state ───────────────────────────────────────────────────────────
-    _theme = {'current': 'light'}
+    Usage:
+        1. Call ``register_*()`` once during figure setup to hand over artist
+           references.
+        2. Call ``apply(name)`` at any time to repaint everything atomically.
+    """
 
-    # Artists we need to re-theme on toggle
-    _A = dict(
-        band_patches=[],   # [(swr_span, imp_span), …] per BAND entry
-        ref_lines=[],      # [3:1, 2:1, 1.5:1]
-        zero_line=None,
-        band_labels=[],    # Text objects
-        legs=[],           # [leg_swr, leg_imp]
-        title_text=None,
-        btn_data=[],       # [{'btn','shadow','highlight','face','is_mswr'}, …]
-        tk_toggle=None,    # Tkinter Button in the toolbar
-        tk_mswr=None,      # Tkinter Min SWR button in the toolbar
-        dot_artists=[],    # Line2D markers for band minima
-    )
+    def __init__(self, initial: str = 'light') -> None:
+        self._current: str = initial
+        self._fig = None
+        self._ax_swr = None
+        self._ax_imp = None
+        self._band_patches: list = []
+        self._ref_lines: list    = []
+        self._zero_line          = None
+        self._band_labels: list  = []
+        self._legs: list         = []
+        self._title_text         = None
+        self._dot_artists: list  = []
+        self._btn_data: list     = []
+        self._tk_toggle          = None
+        self._tk_mswr            = None
+        self._hover_ann          = None
 
-    # ── Figure ────────────────────────────────────────────────────────────────
-    matplotlib.rcParams['savefig.directory'] = os.getcwd()
-    win_title = "SWR Chart: " + "  ".join(ds['label'] for ds in datasets)
-    fig = plt.figure(win_title, figsize=(15, 9))
-    fig.patch.set_facecolor(THEMES['light']['bg_fig'])
+    # ── Registration ──────────────────────────────────────────────────────────
 
-    try:
-        from PIL import ImageTk, Image as PILImage
-        from Xlib import display as Xdisplay
-        _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  'resources', 'icon.png')
-        _win = fig.canvas.manager.window
-        _xid = _win.winfo_id()
-        _d   = Xdisplay.Display()
-        _xw  = _d.create_resource_object('window', _xid)
-        _xw.set_wm_class('swr_chart', 'swr_chart')
-        _d.flush()
-        _d.close()
-        def _apply_icon():
-            try:
-                _img = ImageTk.PhotoImage(PILImage.open(_icon_path))
-                _win.iconphoto(True, _img)
-                _win._icon_img = _img
-            except Exception:
-                pass
-        _win.after(200, _apply_icon)
-    except Exception:
-        pass
+    def register_axes(self, fig: Figure, ax_swr: Axes, ax_imp: Axes) -> None:
+        """Register the figure and both axes."""
+        self._fig    = fig
+        self._ax_swr = ax_swr
+        self._ax_imp = ax_imp
 
-    ax_swr = fig.add_axes([0.07, 0.50, 0.91, 0.40])
-    ax_imp = fig.add_axes([0.07, 0.08, 0.91, 0.37], sharex=ax_swr)
+    def register_band_patches(self, patches: list) -> None:
+        """Register band background spans as ``(swr_span, imp_span)`` pairs."""
+        self._band_patches = patches
 
-    # ── Band shading ──────────────────────────────────────────────────────────
-    T0 = THEMES['light']
-    for i, (_, flo, fhi) in enumerate(BANDS):
-        c = _BAND_COLORS['light'][i]
-        sp_swr = ax_swr.axvspan(flo, fhi, alpha=T0['band_alpha'], color=c, zorder=1)
-        sp_imp = ax_imp.axvspan(flo, fhi, alpha=T0['band_alpha'], color=c, zorder=1)
-        _A['band_patches'].append((sp_swr, sp_imp))
+    def register_ref_lines(self, lines: list) -> None:
+        """Register the SWR reference lines [3:1, 2:1, 1.5:1]."""
+        self._ref_lines = lines
 
-    # ── Reference lines ───────────────────────────────────────────────────────
-    _ref_specs = [
-        (3.0, 'green',     '--', 'SWR 3:1'),
-        (2.0, 'orange',    ':',  'SWR 2:1'),
-        (1.5, 'royalblue', '--', 'SWR 1.5:1'),
-    ]
-    for swr_val, col, ls, lbl in _ref_specs:
-        ln = ax_swr.axhline(swr_val, color=col, ls=ls, lw=1,
-                            alpha=0.75, zorder=2, label=lbl)
-        _A['ref_lines'].append(ln)
-    _A['zero_line'] = ax_imp.axhline(0, color='black', lw=0.6,
-                                     alpha=0.4, zorder=2)
+    def register_zero_line(self, line) -> None:
+        """Register the impedance zero-reference line."""
+        self._zero_line = line
 
-    # ── Data curves ───────────────────────────────────────────────────────────
-    for i, ds in enumerate(datasets):
-        color = COLORS[i % len(COLORS)]
-        ax_swr.plot(ds['freqs'], ds['swrs'], color=color, lw=2.0,
-                    zorder=3, label=ds['label'])
-        for _, fx, sy in find_band_minima(ds['freqs'], ds['swrs']):
-            dot, = ax_swr.plot(fx, sy, 'o', color=color, ms=5, zorder=5,
-                               markeredgecolor='white', markeredgewidth=0.5)
-            _A['dot_artists'].append(dot)
-            ax_swr.text(fx, sy - 1.0, f"{sy:.1f}",
-                        ha='center', va='top', fontsize=7,
-                        color=color, zorder=5, fontweight='bold')
-        ax_imp.plot(ds['freqs'], ds['R'], color=color, lw=2.0,
-                    zorder=3, label=f"{ds['label']} — R")
-        ax_imp.plot(ds['freqs'], ds['X'], color=color, lw=2.0,
-                    ls='--', alpha=0.75, zorder=3, label=f"{ds['label']} — X")
+    def register_band_labels(self, labels: list) -> None:
+        """Register band-name text artists."""
+        self._band_labels = labels
 
-    # ── Axes limits & initial tick setup ──────────────────────────────────────
-    fdata_lo = max(min(ds['freqs'][0]  for ds in datasets), 0.1)
-    fdata_hi =     max(ds['freqs'][-1] for ds in datasets)
-    view_lo  = fdata_lo
-    view_hi  = fdata_hi
+    def register_legends(self, legs: list) -> None:
+        """Register legend objects [leg_swr, leg_imp]."""
+        self._legs = legs
 
-    ax_swr.set_xlim(view_lo, view_hi)
-    ax_swr.set_ylim(1.0, SWR_CAP + 1)
-    ax_imp.set_ylim(-IMP_CAP, IMP_CAP)
+    def register_title(self, text_artist) -> None:
+        """Register the figure title text artist."""
+        self._title_text = text_artist
 
-    for ax in (ax_swr, ax_imp):
-        ax.set_facecolor(T0['bg_axes'])
-        for sp in ax.spines.values():
-            sp.set_edgecolor(T0['spine'])
-        ax.tick_params(colors=T0['fg'], which='both')
-        ax.yaxis.label.set_color(T0['fg'])
-        ax.xaxis.label.set_color(T0['fg'])
-        ax.xaxis.set_major_locator(ticker.MultipleLocator(1.0))
-        ax.xaxis.set_minor_locator(ticker.MultipleLocator(0.5))
-        ax.tick_params(axis='x', which='minor', length=4)
-        ax.grid(True, which='major', color=T0['grid_mj'], alpha=T0['grid_mj_a'], zorder=0)
-        ax.grid(True, which='minor', color=T0['grid_mn'], alpha=T0['grid_mn_a'], ls=':', zorder=0)
+    def register_dot_artists(self, dots: list) -> None:
+        """Register the band-minima marker artists."""
+        self._dot_artists = dots
 
-    ax_swr.yaxis.set_major_locator(ticker.MultipleLocator(5))
-    ax_swr.yaxis.set_minor_locator(ticker.MultipleLocator(1))
-    ax_imp.yaxis.set_major_locator(ticker.MultipleLocator(500))
-    ax_imp.yaxis.set_minor_locator(ticker.MultipleLocator(100))
+    def register_band_buttons(self, btn_data: list) -> None:
+        """Register band button styling dicts."""
+        self._btn_data = btn_data
 
-    ax_swr.tick_params(axis='x', labelsize=8, rotation=45)
-    ax_imp.tick_params(axis='x', labelsize=8, rotation=45)
-    ax_swr.tick_params(axis='y', labelsize=8)
-    ax_imp.tick_params(axis='y', labelsize=8)
+    def register_tk_buttons(self, toggle_btn, mswr_btn) -> None:
+        """Register the Tkinter toolbar buttons."""
+        self._tk_toggle = toggle_btn
+        self._tk_mswr   = mswr_btn
 
-    ax_swr.set_ylabel('SWR (50 Ω)', fontsize=10)
-    ax_imp.set_ylabel(f'Impedance (Ω, clipped ±{IMP_CAP})', fontsize=10)
-    ax_imp.set_xlabel('Frequency (MHz)', fontsize=10)
+    def register_hover_ann(self, ann) -> None:
+        """Register the hover annotation artist."""
+        self._hover_ann = ann
 
-    # ── Band labels ───────────────────────────────────────────────────────────
-    for name, flo, fhi in BANDS:
-        if fhi < view_lo or flo > view_hi:
-            continue
-        mid  = (flo + fhi) / 2
-        frac = (mid - view_lo) / max(view_hi - view_lo, 1e-6)
-        lx   = max(flo, view_lo) if frac < 0.04 else mid
-        ha   = 'left'            if frac < 0.04 else 'center'
-        txt  = ax_swr.text(lx, SWR_CAP * 0.94, name,
-                           ha=ha, va='top', fontsize=8,
-                           fontweight='bold', color=T0['band_label'], zorder=4)
-        _A['band_labels'].append(txt)
+    # ── Runtime ───────────────────────────────────────────────────────────────
 
-    # ── Adaptive tick spacing ─────────────────────────────────────────────────
-    _TICK_STEPS = [
-        (1000.0, 200.000, 50.000), ( 500.0, 100.000, 20.000),
-        ( 200.0,  50.000, 10.000), ( 100.0,  20.000,  5.000),
-        (  50.0,  10.000,  2.000), (  20.0,   5.000,  1.000),
-        (  10.0,   2.000,  0.500), (   5.0,   1.000,  0.250),
-        (   2.0,   0.500,  0.100), (   1.0,   0.250,  0.050),
-        (   0.5,   0.100,  0.025), (   0.2,   0.050,  0.010),
-        (   0.05,  0.020,  0.005), (   0.02,  0.010,  0.002),
-        (   0.005, 0.002,  0.0005),(   0.0,   0.001,  0.0002),
-    ]
+    @property
+    def current(self) -> str:
+        """Name of the currently active theme (``'light'`` or ``'dark'``)."""
+        return self._current
 
-    def _update_xticks(*_):
-        lo, hi = ax_swr.get_xlim()
-        span   = hi - lo
-        major, minor = _TICK_STEPS[-1][1], _TICK_STEPS[-1][2]
-        for max_span, maj, mn in _TICK_STEPS:
-            if span > max_span:
-                major, minor = maj, mn
-                break
-        for ax in (ax_swr, ax_imp):
-            ax.xaxis.set_major_locator(ticker.MultipleLocator(major))
-            ax.xaxis.set_minor_locator(ticker.MultipleLocator(minor))
-        fig.canvas.draw_idle()
+    @property
+    def theme(self) -> dict:
+        """The active theme token dictionary."""
+        return THEMES[self._current]
 
-    ax_swr.callbacks.connect('xlim_changed', _update_xticks)
+    def toggle(self) -> None:
+        """Switch between light and dark themes."""
+        self.apply('dark' if self._current == 'light' else 'light')
 
-    _SWR_YTICKS = [
-        (30.0, 10.0, 2.0), (15.0, 5.0,  1.0),  ( 8.0, 2.0,  0.5),
-        ( 4.0,  1.0, 0.25),( 2.0, 0.5,  0.1),  ( 1.0, 0.25, 0.05),
-        ( 0.0,  0.1, 0.02),
-    ]
-    _IMP_YTICKS = [
-        (1500.0, 500.0, 100.0), ( 800.0, 250.0, 50.0), ( 400.0, 100.0, 25.0),
-        ( 200.0,  50.0,  10.0), ( 100.0,  25.0,  5.0), (  50.0,  10.0,  2.0),
-        (  20.0,   5.0,   1.0), (   0.0,   2.0,  0.5),
-    ]
+    def apply(self, name: str) -> None:
+        """Apply theme *name* to every registered artist and redraw."""
+        T  = THEMES[name]
+        bc = _BAND_COLORS[name]
 
-    def _pick_step(span, table):
-        maj, mn = table[-1][1], table[-1][2]
-        for max_span, m, n in table:
-            if span > max_span:
-                maj, mn = m, n
-                break
-        return maj, mn
+        self._fig.patch.set_facecolor(T['bg_fig'])
 
-    def _update_swr_yticks(*_):
-        lo, hi = ax_swr.get_ylim()
-        maj, mn = _pick_step(hi - lo, _SWR_YTICKS)
-        ax_swr.yaxis.set_major_locator(ticker.MultipleLocator(maj))
-        ax_swr.yaxis.set_minor_locator(ticker.MultipleLocator(mn))
+        for ax in (self._ax_swr, self._ax_imp):
+            ax.set_facecolor(T['bg_axes'])
+            for sp in ax.spines.values():
+                sp.set_edgecolor(T['spine'])
+            ax.tick_params(colors=T['fg'], which='both')
+            ax.yaxis.label.set_color(T['fg'])
+            ax.xaxis.label.set_color(T['fg'])
+            ax.grid(True, which='major',
+                    color=T['grid_mj'], alpha=T['grid_mj_a'], zorder=0)
+            ax.grid(True, which='minor',
+                    color=T['grid_mn'], alpha=T['grid_mn_a'], ls=':', zorder=0)
 
-    def _update_imp_yticks(*_):
-        lo, hi = ax_imp.get_ylim()
-        maj, mn = _pick_step(hi - lo, _IMP_YTICKS)
-        ax_imp.yaxis.set_major_locator(ticker.MultipleLocator(maj))
-        ax_imp.yaxis.set_minor_locator(ticker.MultipleLocator(mn))
+        for i, (sp_swr, sp_imp) in enumerate(self._band_patches):
+            sp_swr.set_facecolor(bc[i])
+            sp_swr.set_alpha(T['band_alpha'])
+            sp_imp.set_facecolor(bc[i])
+            sp_imp.set_alpha(T['band_alpha'])
 
-    ax_swr.callbacks.connect('ylim_changed', _update_swr_yticks)
-    ax_imp.callbacks.connect('ylim_changed', _update_imp_yticks)
+        for line, color in zip(self._ref_lines, T['ref_colors']):
+            line.set_color(color)
 
-    # ── Active bands / zoom ranges ────────────────────────────────────────────
-    active_bands = [(n, lo, hi) for n, lo, hi in BANDS
-                    if any(np.any((ds['freqs'] >= lo) & (ds['freqs'] <= hi))
-                           for ds in datasets)]
+        if self._zero_line is not None:
+            self._zero_line.set_color(T['zero_color'])
+            self._zero_line.set_alpha(T['zero_alpha'])
 
-    btn_labels = ["All"] + [b[0] for b in active_bands]
-    btn_ranges = [(view_lo, view_hi)] + \
-                 [(max(b[1] - min((b[2]-b[1])*2, 0.5), fdata_lo),
-                   min(b[2] + min((b[2]-b[1])*2, 0.5), fdata_hi))
-                  for b in active_bands]
+        for txt in self._band_labels:
+            txt.set_color(T['band_label'])
 
-    n   = len(btn_labels)
-    bh  = 0.030
-    by  = 0.955
-    gap = 0.004
-    bw  = (0.94 - (n - 1) * gap) / n
-    bw  = max(0.035, min(bw, 0.091))
-    total = n * bw + (n - 1) * gap
-    bx0   = (1.0 - total) / 2.0
+        if self._title_text is not None:
+            self._title_text.set_color(T['title_color'])
 
-    def _fit_ylims(xlo, xhi):
-        swr_vals, r_vals, x_vals = [], [], []
-        for ds in datasets:
-            mask = (ds['freqs'] >= xlo) & (ds['freqs'] <= xhi)
-            if mask.any():
-                swr_vals.extend(ds['swrs'][mask].tolist())
-                r_vals.extend(ds['R'][mask].tolist())
-                x_vals.extend(ds['X'][mask].tolist())
-        if swr_vals:
-            ax_swr.set_ylim(1.0, max(max(swr_vals) * 1.12, 3.0))
-        if r_vals or x_vals:
-            imin = min(r_vals + x_vals)
-            imax = max(r_vals + x_vals)
-            pad  = max((imax - imin) * 0.10, 50.0)
-            ax_imp.set_ylim(max(imin - pad, -IMP_CAP),
-                            min(imax + pad,  IMP_CAP))
+        for leg in self._legs:
+            leg.get_frame().set_facecolor(T['leg_face'])
+            leg.get_frame().set_edgecolor(T['leg_edge'])
+            for txt in leg.get_texts():
+                txt.set_color(T['fg'])
 
-    # ── 3-D button helper ─────────────────────────────────────────────────────
-    def _make_btn_patches(ax_b, T):
-        """Add shadow / highlight / face FancyBboxPatches; return their refs."""
+        for bd in self._btn_data:
+            bd['shadow'].set_facecolor(T['btn_shadow'])
+            bd['highlight'].set_facecolor(T['btn_highlight'])
+            bd['face'].set_facecolor(T['btn_base'])
+            bd['btn'].color      = T['btn_base']
+            bd['btn'].hovercolor = T['btn_hover']
+            bd['btn'].label.set_color(
+                T['mswr_fg'] if bd['is_mswr'] else T['btn_fg']
+            )
+
+        for tk_btn in (self._tk_toggle, self._tk_mswr):
+            if tk_btn is not None:
+                tk_btn.configure(
+                    bg=T['btn_base'], fg=T['btn_fg'],
+                    activebackground=T['btn_hover'],
+                    activeforeground=T['btn_fg'],
+                )
+        if self._tk_toggle is not None:
+            self._tk_toggle.configure(text=T['toggle_label'])
+
+        if self._hover_ann is not None:
+            self._hover_ann.get_bbox_patch().set_facecolor(T['hover_fc'])
+            self._hover_ann.get_bbox_patch().set_edgecolor(T['hover_ec'])
+            self._hover_ann.set_color(T['hover_fg'])
+
+        for dot in self._dot_artists:
+            dot.set_markeredgecolor(T['marker_edge'])
+
+        self._current = name
+        self._fig.canvas.draw_idle()
+
+
+# ── AnnotationManager ─────────────────────────────────────────────────────────
+
+class AnnotationManager:
+    """Manages the hover tooltip and pinned tooltips on the SWR plot.
+
+    Hover tooltip:  tracks the mouse; shows frequency, SWR, and impedance.
+                    Only activates when the cursor is within _HOVER_THRESHOLD
+                    (fraction of the visible axis range) of a data trace.
+    Pinned tooltip: left-click near a trace to lock one in place; click the
+                    same spot again to remove it.  Right-click resets zoom.
+    """
+
+    # Fraction of the visible axis range within which the cursor must be to
+    # a data trace before the tooltip activates.
+    _HOVER_THRESHOLD = 0.04
+
+    def __init__(
+        self,
+        ax_swr: Axes,
+        ax_imp: Axes,
+        datasets: list[S1PDataset],
+        theme: ThemeManager,
+        view_lo: float,
+        view_hi: float,
+    ) -> None:
+        self._ax_swr   = ax_swr
+        self._ax_imp   = ax_imp
+        self._datasets = datasets
+        self._theme    = theme
+        self._view_lo  = view_lo
+        self._view_hi  = view_hi
+        self._pinned: list = []
+        self._hover_ann    = self._create_hover_ann()
+        theme.register_hover_ann(self._hover_ann)
+
+    def _create_hover_ann(self):
+        T = self._theme.theme
+        return self._ax_swr.annotate(
+            "", xy=(0, 0), xytext=(14, 14), textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.45", fc=T['hover_fc'],
+                      ec=T['hover_ec'], alpha=0.93, lw=1),
+            arrowprops=dict(arrowstyle="->", color=T['hover_arrow'], lw=0.9),
+            fontsize=9, zorder=12, visible=False, color=T['hover_fg'],
+        )
+
+    def _nearest_trace(self, event) -> tuple[S1PDataset | None, int, float]:
+        """Find the dataset and sample index closest to the cursor.
+
+        Snaps to the nearest sample in X for each dataset, then measures the
+        Y-distance normalised by the visible Y range.  Using Y-only distance
+        keeps the threshold scale-independent at any zoom level — an X-based
+        component would grow large when zoomed in because the data spacing
+        becomes a significant fraction of the tiny visible X span.
+
+        When hovering in the impedance plot the closer of R or X is used.
+
+        Returns:
+            ``(ds, idx, dist)`` — the nearest dataset, its sample index, and
+            the normalised Y distance.  Returns ``(None, 0, inf)`` on failure.
+        """
+        in_swr = (event.inaxes is self._ax_swr)
+        ylo, yhi = event.inaxes.get_ylim()
+        yspan    = max(yhi - ylo, 1e-9)
+
+        best_ds, best_idx, best_dist = None, 0, float('inf')
+        for ds in self._datasets:
+            idx = int(np.argmin(np.abs(ds.freqs - event.xdata)))
+            if in_swr:
+                fy = float(ds.swrs[idx])
+            else:
+                ry = float(ds.rs[idx])
+                xy = float(ds.xs[idx])
+                # Use whichever curve (R or X) is closer to the cursor in Y
+                fy = ry if abs(ry - event.ydata) < abs(xy - event.ydata) else xy
+            dy = abs(fy - event.ydata) / yspan
+            if dy < best_dist:
+                best_dist, best_ds, best_idx = dy, ds, idx
+        return best_ds, best_idx, best_dist
+
+    def _show_hover(self, ds: S1PDataset, idx: int) -> None:
+        fx = float(ds.freqs[idx])
+        sy = float(ds.swrs[idx])
+        self._hover_ann.xy = (fx, sy)
+        self._hover_ann.set_text(_format_tip(ds, idx))
+        lo, hi = self._ax_swr.get_xlim()
+        xfrac  = (fx - lo) / max(hi - lo, 1e-6)
+        self._hover_ann.set_position((-120, 14) if xfrac > 0.82 else (14, 14))
+        self._hover_ann.set_visible(True)
+        self._ax_swr.figure.canvas.draw_idle()
+
+    def on_move(self, event) -> None:
+        """Show or hide the hover tooltip as the mouse moves."""
+        if event.inaxes not in (self._ax_swr, self._ax_imp):
+            self._hover_ann.set_visible(False)
+            self._ax_swr.figure.canvas.draw_idle()
+            return
+        ds, idx, dist = self._nearest_trace(event)
+        if ds is None or dist > self._HOVER_THRESHOLD:
+            self._hover_ann.set_visible(False)
+            self._ax_swr.figure.canvas.draw_idle()
+            return
+        self._show_hover(ds, idx)
+
+    def on_leave(self, event) -> None:
+        """Hide the hover tooltip when the mouse leaves the axes."""
+        self._hover_ann.set_visible(False)
+        self._ax_swr.figure.canvas.draw_idle()
+
+    def on_click(self, event) -> None:
+        """Pin or unpin a tooltip (left click); reset zoom (right click)."""
+        if event.inaxes not in (self._ax_swr, self._ax_imp):
+            return
+        T = self._theme.theme
+        if event.button == 1:
+            ds, idx, dist = self._nearest_trace(event)
+            if ds is None or dist > self._HOVER_THRESHOLD:
+                return
+            fx = float(ds.freqs[idx])
+            # Toggle off if clicking near an existing pin
+            for pa in list(self._pinned):
+                if abs(pa.xy[0] - fx) < 0.05:
+                    pa.remove()
+                    self._pinned.remove(pa)
+                    self._ax_swr.figure.canvas.draw_idle()
+                    return
+            lo, hi = self._ax_swr.get_xlim()
+            xfrac  = (fx - lo) / max(hi - lo, 1e-6)
+            offset = (-130, 20) if xfrac > 0.82 else (14, 20)
+            pa = self._ax_swr.annotate(
+                _format_tip(ds, idx),
+                xy=(fx, float(ds.swrs[idx])),
+                xytext=offset, textcoords="offset points",
+                bbox=dict(boxstyle="round,pad=0.45", fc=T['pin_fc'],
+                          ec=T['pin_ec'], alpha=0.97, lw=1.2),
+                arrowprops=dict(arrowstyle="->", color=T['pin_arrow'], lw=1),
+                fontsize=8.5, zorder=13, color=T['pin_fg'],
+            )
+            self._pinned.append(pa)
+            self._ax_swr.figure.canvas.draw_idle()
+        elif event.button == 3:
+            self._ax_swr.set_xlim(self._view_lo, self._view_hi)
+            self._ax_swr.set_ylim(1.0, SWR_CAP + 1)
+            self._ax_imp.set_ylim(-IMP_CAP, IMP_CAP)
+            self._ax_swr.figure.canvas.draw_idle()
+
+    def on_scroll(self, event) -> None:
+        """Zoom the frequency axis in or out with the scroll wheel."""
+        if event.inaxes not in (self._ax_swr, self._ax_imp):
+            return
+        factor = 0.80 if event.button == 'up' else 1.0 / 0.80
+        lo, hi = self._ax_swr.get_xlim()
+        xd     = event.xdata
+        new_lo = xd - (xd - lo) * factor
+        new_hi = xd + (hi - xd) * factor
+        if new_hi - new_lo < MIN_XSPAN:
+            return   # already at minimum zoom; ignore further scroll-in
+        self._ax_swr.set_xlim(new_lo, new_hi)
+        self._ax_swr.figure.canvas.draw_idle()
+
+    def clear_pins(self) -> None:
+        """Remove all pinned tooltips and hide the hover tooltip."""
+        for pa in list(self._pinned):
+            pa.remove()
+        self._pinned.clear()
+        self._hover_ann.set_visible(False)
+        self._ax_swr.figure.canvas.draw_idle()
+
+
+# ── BandButtonRow ─────────────────────────────────────────────────────────────
+
+class BandButtonRow:
+    """Creates and manages the row of per-band zoom buttons along the top.
+
+    Buttons are laid out dynamically based on which bands appear in the loaded
+    datasets.  Clicking a button zooms both axes to that band and auto-scales
+    the Y axes to fit the visible data.
+
+    Call ``build()`` once after the figure and axes exist.
+    """
+
+    def __init__(
+        self,
+        fig: Figure,
+        ax_swr: Axes,
+        ax_imp: Axes,
+        datasets: list[S1PDataset],
+        active_bands: list,
+        theme: ThemeManager,
+        view_lo: float,
+        view_hi: float,
+    ) -> None:
+        self._fig         = fig
+        self._ax_swr      = ax_swr
+        self._ax_imp      = ax_imp
+        self._datasets    = datasets
+        self._active_bands = active_bands
+        self._theme       = theme
+        self._view_lo     = view_lo
+        self._view_hi     = view_hi
+        self._btn_refs: list = []   # keep Button objects alive (prevents GC)
+        self._btn_data: list = []   # styling dicts handed to ThemeManager
+
+    def build(self) -> None:
+        """Create all button axes, Button widgets, and 3D patch styling."""
+        T = self._theme.theme
+
+        btn_labels = ["All"] + [b[0] for b in self._active_bands]
+        btn_ranges = (
+            [(self._view_lo, self._view_hi)]
+            + [
+                (
+                    max(b[1] - min((b[2] - b[1]) * 2, 0.5), self._view_lo),
+                    min(b[2] + min((b[2] - b[1]) * 2, 0.5), self._view_hi),
+                )
+                for b in self._active_bands
+            ]
+        )
+
+        n     = len(btn_labels)
+        bh    = 0.030
+        by    = 0.955
+        gap   = 0.004
+        bw    = (0.94 - (n - 1) * gap) / n
+        bw    = max(0.035, min(bw, 0.091))
+        total = n * bw + (n - 1) * gap
+        bx0   = (1.0 - total) / 2.0
+
+        for j, (lbl, (rlo, rhi)) in enumerate(zip(btn_labels, btn_ranges)):
+            ax_b = self._fig.add_axes([bx0 + j * (bw + gap), by, bw, bh])
+            b    = Button(ax_b, lbl, color=T['btn_base'],
+                          hovercolor=T['btn_hover'])
+            b.label.set_fontsize(9)
+            b.label.set_color(T['btn_fg'])
+            sh, hl, fc = self._make_btn_patches(ax_b)
+            self._btn_data.append(
+                {'btn': b, 'shadow': sh, 'highlight': hl,
+                 'face': fc, 'is_mswr': False}
+            )
+            b.on_clicked(self._zoom_callback(rlo, rhi))
+            self._btn_refs.append(b)
+
+        self._theme.register_band_buttons(self._btn_data)
+
+    def _make_btn_patches(self, ax_b: Axes) -> tuple:
+        """Add shadow/highlight/face FancyBboxPatches; return their refs.
+
+        Three overlapping rounded rectangles give the button a raised 3-D
+        appearance.  The face patch replaces ``ax_b.patch`` so that
+        matplotlib's Button hover mechanism (which calls
+        ``ax.set_facecolor()``) continues to work correctly.
+        """
+        T = self._theme.theme
         ax_b.set_axis_off()
         shadow = FancyBboxPatch(
             (0.08, 0.0), 0.92, 0.86,
@@ -513,303 +726,92 @@ def main():
         ax_b.add_patch(face)
         return shadow, highlight, face
 
-    # ── Band zoom buttons ─────────────────────────────────────────────────────
-    _btn_refs = []
-    for j, (lbl, (rlo, rhi)) in enumerate(zip(btn_labels, btn_ranges)):
-        ax_b = fig.add_axes([bx0 + j * (bw + gap), by, bw, bh])
-        b    = Button(ax_b, lbl, color=T0['btn_base'], hovercolor=T0['btn_hover'])
-        b.label.set_fontsize(9)
-        b.label.set_color(T0['btn_fg'])
-        sh, hl, fc = _make_btn_patches(ax_b, T0)
-        _A['btn_data'].append({'btn': b, 'shadow': sh,
-                               'highlight': hl, 'face': fc, 'is_mswr': False})
-        def _make_cb(lo, hi):
-            def cb(event):
-                ax_swr.set_xlim(lo, hi)
-                _fit_ylims(lo, hi)
-                fig.canvas.draw_idle()
-            return cb
-        b.on_clicked(_make_cb(rlo, rhi))
-        _btn_refs.append(b)
+    def _fit_ylims(self, xlo: float, xhi: float) -> None:
+        """Auto-scale both Y axes to the data visible in [xlo, xhi]."""
+        swr_vals, r_vals, x_vals = [], [], []
+        for ds in self._datasets:
+            mask = (ds.freqs >= xlo) & (ds.freqs <= xhi)
+            if mask.any():
+                swr_vals.extend(ds.swrs[mask].tolist())
+                r_vals.extend(ds.rs[mask].tolist())
+                x_vals.extend(ds.xs[mask].tolist())
+        if swr_vals:
+            self._ax_swr.set_ylim(1.0, max(max(swr_vals) * 1.12, 3.0))
+        if r_vals or x_vals:
+            imin = min(r_vals + x_vals)
+            imax = max(r_vals + x_vals)
+            pad  = max((imax - imin) * 0.10, 50.0)
+            self._ax_imp.set_ylim(max(imin - pad, -IMP_CAP),
+                                  min(imax + pad,  IMP_CAP))
 
-    # ── Title ─────────────────────────────────────────────────────────────────
-    _A['title_text'] = fig.text(
-        0.5, 0.924, "  vs  ".join(ds['label'] for ds in datasets),
-        ha='center', va='bottom', fontsize=11, fontweight='bold',
-        color=T0['title_color'])
+    def _zoom_callback(self, lo: float, hi: float):
+        """Return a callback that zooms both axes to [lo, hi]."""
+        def cb(event):
+            self._ax_swr.set_xlim(lo, hi)
+            self._fit_ylims(lo, hi)
+            self._fig.canvas.draw_idle()
+        return cb
 
-    # ── Legends ───────────────────────────────────────────────────────────────
-    swr_handles, swr_labels = ax_swr.get_legend_handles_labels()
-    leg_swr = ax_swr.legend(swr_handles, swr_labels,
-                            loc='upper right', fontsize=8)
-    leg_swr.get_frame().set_facecolor(T0['leg_face'])
-    leg_swr.get_frame().set_edgecolor(T0['leg_edge'])
-    for txt in leg_swr.get_texts():
-        txt.set_color(T0['fg'])
 
-    imp_handles = [
-        Line2D([0],[0], color='gray', lw=2, ls='-',  label='R (resistance)'),
-        Line2D([0],[0], color='gray', lw=2, ls='--', label='X (reactance)'),
-    ] + [Line2D([0],[0], color=COLORS[i % len(COLORS)], lw=2,
-                label=ds['label']) for i, ds in enumerate(datasets)]
-    leg_imp = ax_imp.legend(handles=imp_handles, loc='upper right', fontsize=8)
-    leg_imp.get_frame().set_facecolor(T0['leg_face'])
-    leg_imp.get_frame().set_edgecolor(T0['leg_edge'])
-    for txt in leg_imp.get_texts():
-        txt.set_color(T0['fg'])
+# ── MinSWRPopup ───────────────────────────────────────────────────────────────
 
-    _A['legs'] = [leg_swr, leg_imp]
+class MinSWRPopup:
+    """Displays a Tkinter popup table comparing the minimum SWR per band.
 
-    # ── apply_theme ───────────────────────────────────────────────────────────
-    def apply_theme(name):
-        T  = THEMES[name]
-        bc = _BAND_COLORS[name]
+    Calling ``show()`` a second time closes the previous window and opens a
+    fresh one so the table always reflects the current theme.
+    """
 
-        fig.patch.set_facecolor(T['bg_fig'])
+    def __init__(
+        self,
+        datasets: list[S1PDataset],
+        active_bands: list,
+        theme: ThemeManager,
+    ) -> None:
+        self._datasets     = datasets
+        self._active_bands = active_bands
+        self._theme        = theme
+        self._win          = None
 
-        for ax in (ax_swr, ax_imp):
-            ax.set_facecolor(T['bg_axes'])
-            for sp in ax.spines.values():
-                sp.set_edgecolor(T['spine'])
-            ax.tick_params(colors=T['fg'], which='both')
-            ax.yaxis.label.set_color(T['fg'])
-            ax.xaxis.label.set_color(T['fg'])
-            ax.grid(True, which='major',
-                    color=T['grid_mj'], alpha=T['grid_mj_a'], zorder=0)
-            ax.grid(True, which='minor',
-                    color=T['grid_mn'], alpha=T['grid_mn_a'], ls=':', zorder=0)
-
-        for i, (sp_swr, sp_imp) in enumerate(_A['band_patches']):
-            sp_swr.set_facecolor(bc[i])
-            sp_swr.set_alpha(T['band_alpha'])
-            sp_imp.set_facecolor(bc[i])
-            sp_imp.set_alpha(T['band_alpha'])
-
-        for line, color in zip(_A['ref_lines'], T['ref_colors']):
-            line.set_color(color)
-
-        _A['zero_line'].set_color(T['zero_color'])
-        _A['zero_line'].set_alpha(T['zero_alpha'])
-
-        for txt in _A['band_labels']:
-            txt.set_color(T['band_label'])
-
-        _A['title_text'].set_color(T['title_color'])
-
-        for leg in _A['legs']:
-            leg.get_frame().set_facecolor(T['leg_face'])
-            leg.get_frame().set_edgecolor(T['leg_edge'])
-            for txt in leg.get_texts():
-                txt.set_color(T['fg'])
-
-        for bd in _A['btn_data']:
-            bd['shadow'].set_facecolor(T['btn_shadow'])
-            bd['highlight'].set_facecolor(T['btn_highlight'])
-            bd['face'].set_facecolor(T['btn_base'])
-            bd['btn'].color     = T['btn_base']
-            bd['btn'].hovercolor = T['btn_hover']
-            bd['btn'].label.set_color(T['mswr_fg'] if bd['is_mswr'] else T['btn_fg'])
-
-        for _tk_btn in (_A['tk_toggle'], _A['tk_mswr']):
-            if _tk_btn is not None:
-                _tk_btn.configure(
-                    bg=T['btn_base'],
-                    fg=T['btn_fg'],
-                    activebackground=T['btn_hover'],
-                    activeforeground=T['btn_fg'],
-                )
-        if _A['tk_toggle'] is not None:
-            _A['tk_toggle'].configure(text=T['toggle_label'])
-
-        hover_ann.get_bbox_patch().set_facecolor(T['hover_fc'])
-        hover_ann.get_bbox_patch().set_edgecolor(T['hover_ec'])
-        hover_ann.set_color(T['hover_fg'])
-
-        for dot in _A['dot_artists']:
-            dot.set_markeredgecolor(T['marker_edge'])
-
-        _theme['current'] = name
-        fig.canvas.draw_idle()
-
-    def _on_toggle():
-        apply_theme('dark' if _theme['current'] == 'light' else 'light')
-
-    # ── Hover annotation ──────────────────────────────────────────────────────
-    hover_ann = ax_swr.annotate(
-        "", xy=(0, 0), xytext=(14, 14), textcoords="offset points",
-        bbox=dict(boxstyle="round,pad=0.45", fc=T0['hover_fc'],
-                  ec=T0['hover_ec'], alpha=0.93, lw=1),
-        arrowprops=dict(arrowstyle="->", color=T0['hover_arrow'], lw=0.9),
-        fontsize=9, zorder=12, visible=False, color=T0['hover_fg']
-    )
-    pinned = []
-
-    def _show_hover(ds, idx):
-        fx = float(ds['freqs'][idx])
-        sy = float(ds['swrs'][idx])
-        hover_ann.xy = (fx, sy)
-        hover_ann.set_text(tip_text(ds, idx))
-        xfrac = (fx - ax_swr.get_xlim()[0]) / \
-                max(ax_swr.get_xlim()[1] - ax_swr.get_xlim()[0], 1e-6)
-        hover_ann.set_position((-120, 14) if xfrac > 0.82 else (14, 14))
-        hover_ann.set_visible(True)
-        fig.canvas.draw_idle()
-
-    def on_move(event):
-        if event.inaxes not in (ax_swr, ax_imp):
-            hover_ann.set_visible(False)
-            fig.canvas.draw_idle()
-            return
-        ds  = datasets[0]
-        idx = int(np.argmin(np.abs(ds['freqs'] - event.xdata)))
-        _show_hover(ds, idx)
-
-    def on_leave(event):
-        hover_ann.set_visible(False)
-        fig.canvas.draw_idle()
-
-    def on_click(event):
-        if event.inaxes not in (ax_swr, ax_imp):
-            return
-        T = THEMES[_theme['current']]
-        if event.button == 1:
-            ds  = datasets[0]
-            idx = int(np.argmin(np.abs(ds['freqs'] - event.xdata)))
-            fx  = float(ds['freqs'][idx])
-            for pa in list(pinned):
-                if abs(pa.xy[0] - fx) < 0.05:
-                    pa.remove()
-                    pinned.remove(pa)
-                    fig.canvas.draw_idle()
-                    return
-            xfrac  = (fx - ax_swr.get_xlim()[0]) / \
-                     max(ax_swr.get_xlim()[1] - ax_swr.get_xlim()[0], 1e-6)
-            offset = (-130, 20) if xfrac > 0.82 else (14, 20)
-            pa = ax_swr.annotate(
-                tip_text(ds, idx),
-                xy=(fx, float(ds['swrs'][idx])),
-                xytext=offset, textcoords="offset points",
-                bbox=dict(boxstyle="round,pad=0.45", fc=T['pin_fc'],
-                          ec=T['pin_ec'], alpha=0.97, lw=1.2),
-                arrowprops=dict(arrowstyle="->", color=T['pin_arrow'], lw=1),
-                fontsize=8.5, zorder=13, color=T['pin_fg']
-            )
-            pinned.append(pa)
-            fig.canvas.draw_idle()
-        elif event.button == 3:
-            ax_swr.set_xlim(view_lo, view_hi)
-            ax_swr.set_ylim(1.0, SWR_CAP + 1)
-            ax_imp.set_ylim(-IMP_CAP, IMP_CAP)
-            fig.canvas.draw_idle()
-
-    def on_scroll(event):
-        if event.inaxes not in (ax_swr, ax_imp):
-            return
-        factor = 0.80 if event.button == 'up' else 1.0 / 0.80
-        lo, hi = ax_swr.get_xlim()
-        xd     = event.xdata
-        ax_swr.set_xlim(xd - (xd - lo) * factor,
-                        xd + (hi - xd) * factor)
-        fig.canvas.draw_idle()
-
-    fig.canvas.mpl_connect('motion_notify_event', on_move)
-    fig.canvas.mpl_connect('axes_leave_event',    on_leave)
-    fig.canvas.mpl_connect('button_press_event',  on_click)
-    fig.canvas.mpl_connect('scroll_event',        on_scroll)
-
-    # ── Toolbar patches ───────────────────────────────────────────────────────
-    def clear_pins():
-        for pa in list(pinned):
-            pa.remove()
-        pinned.clear()
-        hover_ann.set_visible(False)
-        fig.canvas.draw_idle()
-
-    toolbar = fig.canvas.toolbar
-    if hasattr(toolbar, '_buttons') and 'Home' in toolbar._buttons:
-        def _home_and_clear():
-            toolbar.home()
-            clear_pins()
-        toolbar._buttons['Home'].configure(command=_home_and_clear)
-
-    for _btn_name in ('Back', 'Forward'):
-        if hasattr(toolbar, '_buttons') and _btn_name in toolbar._buttons:
-            toolbar._buttons[_btn_name].pack_forget()
-
-    # ── Dark / Light toggle button in the Tk toolbar ──────────────────────────
-    import tkinter as tk
-    _sep = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
-    _sep.pack(side='left', fill='y', padx=6, pady=3)
-    _tk_toggle = tk.Button(
-        toolbar,
-        text=T0['toggle_label'],
-        command=_on_toggle,
-        relief='raised', bd=2,
-        bg=T0['btn_base'], fg=T0['btn_fg'],
-        activebackground=T0['btn_hover'], activeforeground=T0['btn_fg'],
-        font=('TkDefaultFont', 9, 'bold'),
-        padx=10, pady=1,
-    )
-    _tk_toggle.pack(side='left', padx=2, pady=3)
-    _A['tk_toggle'] = _tk_toggle
-
-    _sep2 = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
-    _sep2.pack(side='left', fill='y', padx=6, pady=3)
-    _tk_mswr = tk.Button(
-        toolbar,
-        text='Minimum SWR by band',
-        command=lambda: show_min_swr_popup(),
-        relief='raised', bd=2,
-        bg=T0['btn_base'], fg=T0['btn_fg'],
-        activebackground=T0['btn_hover'], activeforeground=T0['btn_fg'],
-        font=('TkDefaultFont', 9, 'bold'),
-        padx=10, pady=1,
-    )
-    _tk_mswr.pack(side='left', padx=2, pady=3)
-    _A['tk_mswr'] = _tk_mswr
-
-    # ── Min SWR popup ─────────────────────────────────────────────────────────
-    _popup = {'win': None}
-
-    def show_min_swr_popup():
+    def show(self) -> None:
+        """Open (or reopen) the Min SWR comparison popup."""
         import tkinter as tk
         from tkinter import font as tkfont
-        T = THEMES[_theme['current']]
-        is_dark = (_theme['current'] == 'dark')
 
         try:
-            if _popup['win'] and _popup['win'].winfo_exists():
-                _popup['win'].destroy()
+            if self._win and self._win.winfo_exists():
+                self._win.destroy()
         except Exception:
             pass
 
-        labels   = [ds['label'] for ds in datasets]
-        per_band = {b[0]: {} for b in active_bands}
-        for ds in datasets:
-            for bname, freq, swr in find_band_minima(ds['freqs'], ds['swrs']):
-                if bname in per_band:
-                    per_band[bname][ds['label']] = (freq, swr)
+        T       = self._theme.theme
+        is_dark = (self._theme.current == 'dark')
+        labels  = [ds.label for ds in self._datasets]
 
-        n_cols = len(labels)
-        top    = tk.Toplevel()
-        _popup['win'] = top
+        per_band: dict = {b[0]: {} for b in self._active_bands}
+        for ds in self._datasets:
+            for bname, freq, swr in find_band_minima(ds.freqs, ds.swrs):
+                if bname in per_band:
+                    per_band[bname][ds.label] = (freq, swr)
+
+        n_cols  = len(labels)
+        top     = tk.Toplevel()
+        self._win = top
         top.title("Minimum SWR per Band")
         top.resizable(False, False)
 
-        bg_win  = '#2d2d2d'   if is_dark else '#f5f5f5'
-        bg_hdr  = '#2a3f6f'   if is_dark else '#b0bcee'
-        fg_hdr  = '#c8d8f8'   if is_dark else '#222222'
-        bg_band = '#3a3a3a'   if is_dark else '#e0e0e0'
-        bg_cell = '#2d2d2d'   if is_dark else 'white'
-        fg_cell = T['fg']
-        bg_best = '#1a3a1a'   if is_dark else '#b8f0b8'
-        bg_none = '#252525'   if is_dark else '#eeeeee'
-        fg_none = '#555555'   if is_dark else '#888888'
-        fg_star = '#5ba3f5'   if is_dark else '#0055cc'
-        bg_foot = bg_win
+        bg_win  = '#2d2d2d' if is_dark else '#f5f5f5'
+        bg_hdr  = '#2a3f6f' if is_dark else '#b0bcee'
+        fg_hdr  = '#c8d8f8' if is_dark else '#222222'
+        bg_band = '#3a3a3a' if is_dark else '#e0e0e0'
+        bg_cell = '#2d2d2d' if is_dark else 'white'
+        bg_best = '#1a3a1a' if is_dark else '#b8f0b8'
+        bg_none = '#252525' if is_dark else '#eeeeee'
+        fg_none = '#555555' if is_dark else '#888888'
+        fg_star = '#5ba3f5' if is_dark else '#0055cc'
 
         top.configure(bg=bg_win)
-        PAD      = 6
+        PAD       = 6
         hdr_font  = tkfont.Font(family='TkDefaultFont', size=9, weight='bold')
         cell_font = tkfont.Font(family='TkDefaultFont', size=9)
 
@@ -824,8 +826,8 @@ def main():
                      relief='ridge', bd=1, padx=PAD, pady=PAD
                      ).grid(row=0, column=j + 1, sticky='nsew')
 
-        for i, (bname, *_) in enumerate(active_bands):
-            tk.Label(top, text=bname, font=hdr_font, bg=bg_band, fg=fg_cell,
+        for i, (bname, *_) in enumerate(self._active_bands):
+            tk.Label(top, text=bname, font=hdr_font, bg=bg_band, fg=T['fg'],
                      relief='ridge', bd=1, padx=PAD, pady=PAD
                      ).grid(row=i + 1, column=0, sticky='nsew')
 
@@ -841,13 +843,13 @@ def main():
                     freq, swr = per_band[bname][lbl]
                     swr_str = f">{SWR_CAP}" if swr >= SWR_CAP else f"{swr:.2f}"
                     is_best = (n_cols > 1 and abs(swr - best_swr) < 1e-6)
-                    bg = bg_best if is_best else bg_cell
+                    bg  = bg_best if is_best else bg_cell
                     frm = _cf(top, bg)
                     frm.grid(row=i + 1, column=j + 1, sticky='nsew')
                     line1 = tk.Frame(frm, bg=bg)
                     line1.pack(anchor='w', padx=PAD, pady=(PAD, 0))
                     tk.Label(line1, text=swr_str, font=cell_font,
-                             bg=bg, fg=fg_cell).pack(side='left')
+                             bg=bg, fg=T['fg']).pack(side='left')
                     if is_best:
                         sf = tkfont.Font(family='TkDefaultFont', size=14)
                         tk.Label(line1, text=" ★", font=sf,
@@ -863,20 +865,427 @@ def main():
 
         if n_cols > 1:
             tk.Label(top, text="★  = lowest SWR in band",
-                     font=tkfont.Font(size=9), fg=fg_star, bg=bg_foot,
-                     pady=4).grid(row=len(active_bands) + 1, column=0,
+                     font=tkfont.Font(size=9), fg=fg_star, bg=bg_win,
+                     pady=4).grid(row=len(self._active_bands) + 1, column=0,
                                   columnspan=n_cols + 1)
 
         top.update_idletasks()
         top.lift()
         top.focus_force()
 
-    # Apply initial theme to ensure consistency
-    apply_theme('light')
 
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    plt.show()
+# ── SWRApp ────────────────────────────────────────────────────────────────────
+
+class SWRApp:
+    """Main application controller.
+
+    Constructs all subsystems, wires them together, and starts the Tk event
+    loop.  All mutable state is owned by the appropriate subsystem; ``SWRApp``
+    itself is the coordinator.
+
+    Usage::
+
+        datasets = [parse_s1p(p) for p in paths]
+        SWRApp(datasets).run()
+    """
+
+    # ── Adaptive tick-spacing look-up tables (class constants) ────────────────
+
+    _TICK_STEPS = [
+        (1000.0, 200.000, 50.000), ( 500.0, 100.000, 20.000),
+        ( 200.0,  50.000, 10.000), ( 100.0,  20.000,  5.000),
+        (  50.0,  10.000,  2.000), (  20.0,   5.000,  1.000),
+        (  10.0,   2.000,  0.500), (   5.0,   1.000,  0.250),
+        (   2.0,   0.500,  0.100), (   1.0,   0.250,  0.050),
+        (   0.5,   0.100,  0.025), (   0.2,   0.050,  0.010),
+        (   0.05,  0.020,  0.005), (   0.02,  0.010,  0.002),
+        (   0.005, 0.002,  0.0005),(   0.0,   0.001,  0.0002),
+    ]
+    _SWR_YTICKS = [
+        (30.0, 10.0, 2.0), (15.0, 5.0,  1.0), ( 8.0, 2.0,  0.5),
+        ( 4.0,  1.0, 0.25),( 2.0, 0.5,  0.1), ( 1.0, 0.25, 0.05),
+        ( 0.0,  0.1, 0.02),
+    ]
+    _IMP_YTICKS = [
+        (1500.0, 500.0, 100.0), ( 800.0, 250.0, 50.0), ( 400.0, 100.0, 25.0),
+        ( 200.0,  50.0,  10.0), ( 100.0,  25.0,  5.0), (  50.0,  10.0,  2.0),
+        (  20.0,   5.0,   1.0), (   0.0,   2.0,  0.5),
+    ]
+
+    def __init__(self, datasets: list[S1PDataset]) -> None:
+        self._datasets = datasets
+        self._theme    = ThemeManager('light')
+
+        self._fdata_lo = max(min(ds.freqs[0]  for ds in datasets), 0.1)
+        self._fdata_hi =     max(ds.freqs[-1] for ds in datasets)
+
+        self._active_bands = [
+            (n, lo, hi) for n, lo, hi in BANDS
+            if any(
+                np.any((ds.freqs >= lo) & (ds.freqs <= hi))
+                for ds in datasets
+            )
+        ]
+
+        self._fig: Figure           = None
+        self._ax_swr: Axes          = None
+        self._ax_imp: Axes          = None
+        self._annotations: AnnotationManager = None
+        self._band_row: BandButtonRow        = None
+        self._popup: MinSWRPopup             = None
+        self._clamping_xlim: bool            = False  # recursion guard for xlim clamp
+
+        self._create_figure()
+        self._plot_data()
+        self._setup_axes()
+        self._build_band_buttons()
+        self._setup_annotations()
+        self._patch_toolbar()
+        self._theme.apply('light')
+
+    def run(self) -> None:
+        """Enter the matplotlib/Tk event loop."""
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        plt.show()
+
+    # ── Private setup steps ───────────────────────────────────────────────────
+
+    def _create_figure(self) -> None:
+        """Create the matplotlib figure and the two shared-axis axes."""
+        matplotlib.rcParams['savefig.directory'] = os.getcwd()
+        win_title  = "SWR Chart: " + "  ".join(ds.label for ds in self._datasets)
+        self._fig  = plt.figure(win_title, figsize=(15, 9))
+        self._fig.patch.set_facecolor(self._theme.theme['bg_fig'])
+
+        self._try_set_icon()
+
+        self._ax_swr = self._fig.add_axes([0.07, 0.50, 0.91, 0.40])
+        self._ax_imp = self._fig.add_axes(
+            [0.07, 0.08, 0.91, 0.37], sharex=self._ax_swr
+        )
+        self._theme.register_axes(self._fig, self._ax_swr, self._ax_imp)
+
+    def _try_set_icon(self) -> None:
+        """Attempt to set the window icon; silently ignore any failure."""
+        try:
+            from PIL import ImageTk, Image as PILImage
+            from Xlib import display as Xdisplay
+            icon_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                'resources', 'icon.png',
+            )
+            win = self._fig.canvas.manager.window
+            xid = win.winfo_id()
+            d   = Xdisplay.Display()
+            xw  = d.create_resource_object('window', xid)
+            xw.set_wm_class('swr_chart', 'swr_chart')
+            d.flush()
+            d.close()
+            def _apply():
+                try:
+                    img = ImageTk.PhotoImage(PILImage.open(icon_path))
+                    win.iconphoto(True, img)
+                    win._icon_img = img   # prevent garbage collection
+                except Exception:
+                    pass
+            win.after(200, _apply)
+        except Exception:
+            pass
+
+    def _plot_data(self) -> None:
+        """Draw band shading, reference lines, data curves, and minima markers."""
+        T0 = self._theme.theme
+
+        # Band shading
+        band_patches = []
+        for i, (_, flo, fhi) in enumerate(BANDS):
+            c      = _BAND_COLORS['light'][i]
+            sp_swr = self._ax_swr.axvspan(flo, fhi, alpha=T0['band_alpha'],
+                                          color=c, zorder=1)
+            sp_imp = self._ax_imp.axvspan(flo, fhi, alpha=T0['band_alpha'],
+                                          color=c, zorder=1)
+            band_patches.append((sp_swr, sp_imp))
+        self._theme.register_band_patches(band_patches)
+
+        # Reference lines
+        ref_specs = [
+            (3.0, 'green',     '--', 'SWR 3:1'),
+            (2.0, 'orange',    ':',  'SWR 2:1'),
+            (1.5, 'royalblue', '--', 'SWR 1.5:1'),
+        ]
+        ref_lines = []
+        for swr_val, col, ls, lbl in ref_specs:
+            ln = self._ax_swr.axhline(swr_val, color=col, ls=ls, lw=1,
+                                      alpha=0.75, zorder=2, label=lbl)
+            ref_lines.append(ln)
+        self._theme.register_ref_lines(ref_lines)
+
+        zero_line = self._ax_imp.axhline(0, color='black', lw=0.6,
+                                         alpha=0.4, zorder=2)
+        self._theme.register_zero_line(zero_line)
+
+        # Data curves and band-minima markers
+        dot_artists = []
+        for i, ds in enumerate(self._datasets):
+            color = COLORS[i % len(COLORS)]
+            self._ax_swr.plot(ds.freqs, ds.swrs, color=color, lw=2.0,
+                              zorder=3, label=ds.label)
+            for _, fx, sy in find_band_minima(ds.freqs, ds.swrs):
+                dot, = self._ax_swr.plot(
+                    fx, sy, 'o', color=color, ms=5, zorder=5,
+                    markeredgecolor='white', markeredgewidth=0.5,
+                )
+                dot_artists.append(dot)
+                self._ax_swr.text(
+                    fx, sy - 1.0, f"{sy:.1f}",
+                    ha='center', va='top', fontsize=7,
+                    color=color, zorder=5, fontweight='bold',
+                )
+            self._ax_imp.plot(ds.freqs, ds.rs, color=color, lw=2.0,
+                              zorder=3, label=f"{ds.label} — R")
+            self._ax_imp.plot(ds.freqs, ds.xs, color=color, lw=2.0,
+                              ls='--', alpha=0.75, zorder=3,
+                              label=f"{ds.label} — X")
+        self._theme.register_dot_artists(dot_artists)
+
+    def _setup_axes(self) -> None:
+        """Set axis limits, labels, grids, tick locators, and band labels."""
+        T0 = self._theme.theme
+
+        self._ax_swr.set_xlim(self._fdata_lo, self._fdata_hi)
+        self._ax_swr.set_ylim(1.0, SWR_CAP + 1)
+        self._ax_imp.set_ylim(-IMP_CAP, IMP_CAP)
+
+        for ax in (self._ax_swr, self._ax_imp):
+            ax.set_facecolor(T0['bg_axes'])
+            for sp in ax.spines.values():
+                sp.set_edgecolor(T0['spine'])
+            ax.tick_params(colors=T0['fg'], which='both')
+            ax.yaxis.label.set_color(T0['fg'])
+            ax.xaxis.label.set_color(T0['fg'])
+            ax.xaxis.set_major_locator(ticker.MultipleLocator(1.0))
+            ax.xaxis.set_minor_locator(ticker.MultipleLocator(0.5))
+            ax.tick_params(axis='x', which='minor', length=4)
+            ax.grid(True, which='major', color=T0['grid_mj'],
+                    alpha=T0['grid_mj_a'], zorder=0)
+            ax.grid(True, which='minor', color=T0['grid_mn'],
+                    alpha=T0['grid_mn_a'], ls=':', zorder=0)
+
+        self._ax_swr.yaxis.set_major_locator(ticker.MultipleLocator(5))
+        self._ax_swr.yaxis.set_minor_locator(ticker.MultipleLocator(1))
+        self._ax_imp.yaxis.set_major_locator(ticker.MultipleLocator(500))
+        self._ax_imp.yaxis.set_minor_locator(ticker.MultipleLocator(100))
+
+        self._ax_swr.tick_params(axis='x', labelsize=8, rotation=45)
+        self._ax_imp.tick_params(axis='x', labelsize=8, rotation=45)
+        self._ax_swr.tick_params(axis='y', labelsize=8)
+        self._ax_imp.tick_params(axis='y', labelsize=8)
+
+        self._ax_swr.set_ylabel('SWR (50 Ω)', fontsize=10)
+        self._ax_imp.set_ylabel(f'Impedance (Ω, clipped ±{IMP_CAP})', fontsize=10)
+        self._ax_imp.set_xlabel('Frequency (MHz)', fontsize=10)
+
+        # Always show full frequency values (e.g. 14.008, not .008 + offset).
+        _xfmt = ticker.ScalarFormatter(useOffset=False)
+        _xfmt.set_scientific(False)
+        for ax in (self._ax_swr, self._ax_imp):
+            ax.xaxis.set_major_formatter(_xfmt)
+
+        # Adaptive tick callbacks
+        self._ax_swr.callbacks.connect('xlim_changed', self._update_xticks)
+        self._ax_swr.callbacks.connect('ylim_changed', self._update_swr_yticks)
+        self._ax_imp.callbacks.connect('ylim_changed', self._update_imp_yticks)
+
+        # Band labels
+        view_lo, view_hi = self._fdata_lo, self._fdata_hi
+        band_labels = []
+        for name, flo, fhi in BANDS:
+            if fhi < view_lo or flo > view_hi:
+                continue
+            mid  = (flo + fhi) / 2
+            frac = (mid - view_lo) / max(view_hi - view_lo, 1e-6)
+            lx   = max(flo, view_lo) if frac < 0.04 else mid
+            ha   = 'left'            if frac < 0.04 else 'center'
+            txt  = self._ax_swr.text(
+                lx, SWR_CAP * 0.94, name,
+                ha=ha, va='top', fontsize=8,
+                fontweight='bold', color=T0['band_label'], zorder=4,
+            )
+            band_labels.append(txt)
+        self._theme.register_band_labels(band_labels)
+
+        # Title
+        title = self._fig.text(
+            0.5, 0.924,
+            "  vs  ".join(ds.label for ds in self._datasets),
+            ha='center', va='bottom', fontsize=11, fontweight='bold',
+            color=T0['title_color'],
+        )
+        self._theme.register_title(title)
+
+        # Legends
+        swr_handles, swr_labels = self._ax_swr.get_legend_handles_labels()
+        leg_swr = self._ax_swr.legend(swr_handles, swr_labels,
+                                      loc='upper right', fontsize=8)
+        leg_swr.get_frame().set_facecolor(T0['leg_face'])
+        leg_swr.get_frame().set_edgecolor(T0['leg_edge'])
+        for txt in leg_swr.get_texts():
+            txt.set_color(T0['fg'])
+
+        imp_handles = [
+            Line2D([0], [0], color='gray', lw=2, ls='-',
+                   label='R (resistance)'),
+            Line2D([0], [0], color='gray', lw=2, ls='--',
+                   label='X (reactance)'),
+        ] + [
+            Line2D([0], [0], color=COLORS[i % len(COLORS)], lw=2,
+                   label=ds.label)
+            for i, ds in enumerate(self._datasets)
+        ]
+        leg_imp = self._ax_imp.legend(handles=imp_handles,
+                                      loc='upper right', fontsize=8)
+        leg_imp.get_frame().set_facecolor(T0['leg_face'])
+        leg_imp.get_frame().set_edgecolor(T0['leg_edge'])
+        for txt in leg_imp.get_texts():
+            txt.set_color(T0['fg'])
+
+        self._theme.register_legends([leg_swr, leg_imp])
+
+    def _build_band_buttons(self) -> None:
+        """Instantiate BandButtonRow and MinSWRPopup."""
+        self._band_row = BandButtonRow(
+            self._fig, self._ax_swr, self._ax_imp,
+            self._datasets, self._active_bands, self._theme,
+            self._fdata_lo, self._fdata_hi,
+        )
+        self._band_row.build()
+        self._popup = MinSWRPopup(
+            self._datasets, self._active_bands, self._theme
+        )
+
+    def _setup_annotations(self) -> None:
+        """Create the AnnotationManager and connect canvas events."""
+        self._annotations = AnnotationManager(
+            self._ax_swr, self._ax_imp, self._datasets, self._theme,
+            self._fdata_lo, self._fdata_hi,
+        )
+        c = self._fig.canvas.mpl_connect
+        c('motion_notify_event', self._annotations.on_move)
+        c('axes_leave_event',    self._annotations.on_leave)
+        c('button_press_event',  self._annotations.on_click)
+        c('scroll_event',        self._annotations.on_scroll)
+
+    def _patch_toolbar(self) -> None:
+        """Remove Back/Forward buttons; add Dark/Light and Min SWR buttons."""
+        import tkinter as tk
+        toolbar = self._fig.canvas.toolbar
+        T0      = self._theme.theme
+
+        if hasattr(toolbar, '_buttons') and 'Home' in toolbar._buttons:
+            def _home_and_clear():
+                toolbar.home()
+                self._annotations.clear_pins()
+            toolbar._buttons['Home'].configure(command=_home_and_clear)
+
+        for name in ('Back', 'Forward'):
+            if hasattr(toolbar, '_buttons') and name in toolbar._buttons:
+                toolbar._buttons[name].pack_forget()
+
+        sep1 = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
+        sep1.pack(side='left', fill='y', padx=6, pady=3)
+
+        tk_toggle = tk.Button(
+            toolbar, text=T0['toggle_label'],
+            command=self._theme.toggle,
+            relief='raised', bd=2,
+            bg=T0['btn_base'], fg=T0['btn_fg'],
+            activebackground=T0['btn_hover'], activeforeground=T0['btn_fg'],
+            font=('TkDefaultFont', 9, 'bold'), padx=10, pady=1,
+        )
+        tk_toggle.pack(side='left', padx=2, pady=3)
+
+        sep2 = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
+        sep2.pack(side='left', fill='y', padx=6, pady=3)
+
+        tk_mswr = tk.Button(
+            toolbar, text='Minimum SWR by band',
+            command=self._popup.show,
+            relief='raised', bd=2,
+            bg=T0['btn_base'], fg=T0['btn_fg'],
+            activebackground=T0['btn_hover'], activeforeground=T0['btn_fg'],
+            font=('TkDefaultFont', 9, 'bold'), padx=10, pady=1,
+        )
+        tk_mswr.pack(side='left', padx=2, pady=3)
+
+        self._theme.register_tk_buttons(tk_toggle, tk_mswr)
+
+    # ── Adaptive tick callbacks ────────────────────────────────────────────────
+
+    @staticmethod
+    def _pick_step(span: float, table: list) -> tuple[float, float]:
+        """Select major/minor tick spacing from *table* for the given *span*."""
+        maj, mn = table[-1][1], table[-1][2]
+        for max_span, m, n in table:
+            if span > max_span:
+                maj, mn = m, n
+                break
+        return maj, mn
+
+    def _update_xticks(self, *_) -> None:
+        if self._clamping_xlim:
+            return
+        lo, hi = self._ax_swr.get_xlim()
+        if hi - lo < MIN_XSPAN:
+            # Toolbar zoom went past the minimum; clamp and re-centre.
+            self._clamping_xlim = True
+            mid = (lo + hi) / 2
+            self._ax_swr.set_xlim(mid - MIN_XSPAN / 2, mid + MIN_XSPAN / 2)
+            self._clamping_xlim = False
+            return   # xlim_changed fires again with the clamped span
+        major, minor = self._pick_step(hi - lo, self._TICK_STEPS)
+        for ax in (self._ax_swr, self._ax_imp):
+            ax.xaxis.set_major_locator(ticker.MultipleLocator(major))
+            ax.xaxis.set_minor_locator(ticker.MultipleLocator(minor))
+        self._fig.canvas.draw_idle()
+
+    def _update_swr_yticks(self, *_) -> None:
+        lo, hi = self._ax_swr.get_ylim()
+        maj, mn = self._pick_step(hi - lo, self._SWR_YTICKS)
+        self._ax_swr.yaxis.set_major_locator(ticker.MultipleLocator(maj))
+        self._ax_swr.yaxis.set_minor_locator(ticker.MultipleLocator(mn))
+
+    def _update_imp_yticks(self, *_) -> None:
+        lo, hi = self._ax_imp.get_ylim()
+        maj, mn = self._pick_step(hi - lo, self._IMP_YTICKS)
+        self._ax_imp.yaxis.set_major_locator(ticker.MultipleLocator(maj))
+        self._ax_imp.yaxis.set_minor_locator(ticker.MultipleLocator(mn))
 
 
-if __name__ == "__main__":
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    args = sys.argv[1:]
+    if not args or '--help' in args:
+        print(__doc__)
+        sys.exit(0 if '--help' in args else 1)
+
+    datasets: list[S1PDataset] = []
+    for path in args:
+        if not os.path.exists(path):
+            print(f"Warning: {path} not found – skipped")
+            continue
+        ds = parse_s1p(path)
+        if len(ds.freqs) == 0:
+            print(f"Warning: no data in {path} – skipped")
+            continue
+        datasets.append(ds)
+
+    if not datasets:
+        print("No valid files loaded.")
+        sys.exit(1)
+
+    SWRApp(datasets).run()
+
+
+if __name__ == '__main__':
     main()
