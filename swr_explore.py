@@ -29,8 +29,10 @@ Controls:
     Band buttons (top)   – zoom to that ham band; Y axes auto-scale
     Toolbar ⌂ Home       – reset zoom and clear all pinned tooltips
     Toolbar 💾 Save      – save figure to the current directory
-    Toolbar Dark/Light   – toggle dark and light colour themes
+    Toolbar 💡 icon      – toggle dark and light colour themes (right of Save)
+    Toolbar Impedance▼▲  – show or hide the impedance panel
     Toolbar Min SWR      – open per-band minimum SWR comparison table
+    Toolbar Smith Chart  – open a Smith Chart for the visible frequency range
 """
 
 from __future__ import annotations
@@ -145,6 +147,107 @@ THEMES = {
         marker_edge='#1e1e1e',
     ),
 }
+
+# ── Lightbulb toolbar icon ─────────────────────────────────────────────────────
+# 16×16 pixel masks: '1' = foreground colour, '0' = background colour.
+# Lit  = solid filled globe (theme is dark → click to go light).
+# Unlit = outline-only globe (theme is light → click to go dark).
+_BULB_LIT = [
+    "0000011111000000",
+    "0000111111100000",
+    "0001111111110000",
+    "0011111111111000",
+    "0011111111111000",
+    "0011111111111000",
+    "0001111111110000",
+    "0000111111100000",
+    "0000111111100000",
+    "0000011111000000",
+    "0000011111000000",
+    "0000011111000000",
+    "0000001110000000",
+    "0000000000000000",
+    "0000000000000000",
+    "0000000000000000",
+]
+_BULB_UNLIT = [
+    "0000011111000000",
+    "0000100000100000",
+    "0001000000010000",
+    "0010000000001000",
+    "0010000000001000",
+    "0010000000001000",
+    "0001000000010000",
+    "0000100000100000",
+    "0000111111100000",
+    "0000011111000000",
+    "0000011111000000",
+    "0000011111000000",
+    "0000001110000000",
+    "0000000000000000",
+    "0000000000000000",
+    "0000000000000000",
+]
+
+
+def _make_bulb_photo(lit: bool, fg: str, bg: str) -> object:
+    """Return a 16×16 tk.PhotoImage lightbulb icon.
+
+    Args:
+        lit: True for a solid filled bulb (dark theme active); False for outline only.
+        fg:  Foreground colour string (the bulb drawing colour).
+        bg:  Background colour string (the button face colour).
+    """
+    import tkinter as tk
+    mask = _BULB_LIT if lit else _BULB_UNLIT
+    img  = tk.PhotoImage(width=16, height=16)
+    rows = ['{' + ' '.join(fg if ch == '1' else bg for ch in row) + '}'
+            for row in mask]
+    img.put(' '.join(rows))
+    return img
+
+
+# ── Tooltip helper ────────────────────────────────────────────────────────────
+
+class Tooltip:
+    """Lightweight hover tooltip for a Tk widget.
+
+    Displays a small label below the widget on mouse-enter and destroys it on
+    mouse-leave.  Call ``update_text()`` to change the message at any time.
+    """
+
+    def __init__(self, widget, text: str) -> None:
+        self._widget = widget
+        self._text   = text
+        self._tip    = None
+        widget.bind('<Enter>', self._show)
+        widget.bind('<Leave>', self._hide)
+
+    def update_text(self, text: str) -> None:
+        self._text = text
+
+    def _show(self, event=None) -> None:
+        if self._tip is not None:
+            return
+        import tkinter as tk
+        w   = self._widget
+        x   = w.winfo_rootx() + w.winfo_width() // 2
+        y   = w.winfo_rooty() + w.winfo_height() + 4
+        tip = tk.Toplevel(w)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f'+{x}+{y}')
+        tk.Label(
+            tip, text=self._text, justify='left',
+            bg='#ffffe0', fg='#333333',
+            relief='solid', bd=1,
+            font=('TkDefaultFont', 9), padx=6, pady=3,
+        ).pack()
+        self._tip = tip
+
+    def _hide(self, event=None) -> None:
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
 
 
 # ── Data container ────────────────────────────────────────────────────────────
@@ -299,8 +402,8 @@ class ThemeManager:
         self._title_text         = None
         self._dot_artists: list  = []
         self._btn_data: list     = []
-        self._tk_toggle          = None
-        self._tk_mswr            = None
+        self._tk_toggle          = None   # special: also gets label text updated
+        self._tk_buttons: list   = []     # all themed toolbar buttons
         self._hover_ann          = None
 
     # ── Registration ──────────────────────────────────────────────────────────
@@ -343,10 +446,14 @@ class ThemeManager:
         """Register band button styling dicts."""
         self._btn_data = btn_data
 
-    def register_tk_buttons(self, toggle_btn, mswr_btn) -> None:
-        """Register the Tkinter toolbar buttons."""
-        self._tk_toggle = toggle_btn
-        self._tk_mswr   = mswr_btn
+    def register_tk_buttons(self, toggle_btn, *extra_btns) -> None:
+        """Register Tkinter toolbar buttons for theming.
+
+        *toggle_btn* is also updated with the theme label text on each apply.
+        Pass any number of additional buttons as extra positional arguments.
+        """
+        self._tk_toggle  = toggle_btn
+        self._tk_buttons = [b for b in (toggle_btn, *extra_btns) if b is not None]
 
     def register_hover_ann(self, ann) -> None:
         """Register the hover annotation artist."""
@@ -422,15 +529,16 @@ class ThemeManager:
                 T['mswr_fg'] if bd['is_mswr'] else T['btn_fg']
             )
 
-        for tk_btn in (self._tk_toggle, self._tk_mswr):
-            if tk_btn is not None:
-                tk_btn.configure(
-                    bg=T['btn_base'], fg=T['btn_fg'],
-                    activebackground=T['btn_hover'],
-                    activeforeground=T['btn_fg'],
-                )
+        for tk_btn in self._tk_buttons:
+            tk_btn.configure(
+                bg=T['btn_base'], fg=T['btn_fg'],
+                activebackground=T['btn_hover'],
+                activeforeground=T['btn_fg'],
+            )
         if self._tk_toggle is not None:
-            self._tk_toggle.configure(text=T['toggle_label'])
+            img = _make_bulb_photo(name == 'dark', T['btn_fg'], T['btn_base'])
+            self._tk_toggle._bulb_img = img   # prevent garbage collection
+            self._tk_toggle.configure(image=img)
 
         if self._hover_ann is not None:
             self._hover_ann.get_bbox_patch().set_facecolor(T['hover_fc'])
@@ -534,9 +642,13 @@ class AnnotationManager:
         self._hover_ann.set_visible(True)
         self._ax_swr.figure.canvas.draw_idle()
 
+    def _active_axes(self) -> tuple:
+        """Return the axes that are currently visible and should receive events."""
+        return tuple(ax for ax in (self._ax_swr, self._ax_imp) if ax.get_visible())
+
     def on_move(self, event) -> None:
         """Show or hide the hover tooltip as the mouse moves."""
-        if event.inaxes not in (self._ax_swr, self._ax_imp):
+        if event.inaxes not in self._active_axes():
             self._hover_ann.set_visible(False)
             self._ax_swr.figure.canvas.draw_idle()
             return
@@ -554,7 +666,7 @@ class AnnotationManager:
 
     def on_click(self, event) -> None:
         """Pin or unpin a tooltip (left click); reset zoom (right click)."""
-        if event.inaxes not in (self._ax_swr, self._ax_imp):
+        if event.inaxes not in self._active_axes():
             return
         T = self._theme.theme
         if event.button == 1:
@@ -591,7 +703,7 @@ class AnnotationManager:
 
     def on_scroll(self, event) -> None:
         """Zoom the frequency axis in or out with the scroll wheel."""
-        if event.inaxes not in (self._ax_swr, self._ax_imp):
+        if event.inaxes not in self._active_axes():
             return
         factor = 0.80 if event.button == 'up' else 1.0 / 0.80
         lo, hi = self._ax_swr.get_xlim()
@@ -797,7 +909,7 @@ class MinSWRPopup:
         n_cols  = len(labels)
         top     = tk.Toplevel()
         self._win = top
-        top.title("Minimum SWR per Band")
+        top.title("Minimum SWR by band")
         top.resizable(False, False)
 
         bg_win  = '#2d2d2d' if is_dark else '#f5f5f5'
@@ -869,9 +981,314 @@ class MinSWRPopup:
                      pady=4).grid(row=len(self._active_bands) + 1, column=0,
                                   columnspan=n_cols + 1)
 
+        for col in range(n_cols + 1):
+            top.columnconfigure(col, weight=1)
+
         top.update_idletasks()
+        # Ensure the window is wide enough to show the full title bar text.
+        # "Minimum SWR by band" needs ~300 px including OS window controls.
+        min_w = max(top.winfo_reqwidth(), 300)
+        top.geometry(f"{min_w}x{top.winfo_reqheight()}")
         top.lift()
         top.focus_force()
+
+
+# ── SmithChartPopup ───────────────────────────────────────────────────────────
+
+class SmithChartPopup:
+    """Smith Chart for a specific frequency range.
+
+    Each call to ``show()`` opens an independent window.  Multiple windows
+    can be active simultaneously, each capturing the zoom level at the moment
+    the button was clicked.
+    """
+
+    # Normalised resistance values to draw as grid circles
+    _R_CIRCLES = [0.2, 0.5, 1.0, 2.0, 5.0]
+    # Normalised reactance magnitudes to draw as grid arcs (±)
+    _X_ARCS    = [0.2, 0.5, 1.0, 2.0, 5.0]
+    _N_PTS     = 1000   # parametric points per circle / arc
+
+    def __init__(
+        self,
+        datasets: list[S1PDataset],
+        theme: ThemeManager,
+        freq_lo: float,
+        freq_hi: float,
+    ) -> None:
+        self._datasets = datasets
+        self._theme    = theme
+        self._freq_lo  = freq_lo
+        self._freq_hi  = freq_hi
+
+    def show(self) -> None:
+        """Open a new Smith Chart window."""
+        import tkinter as tk
+        from matplotlib.backends.backend_tkagg import (
+            FigureCanvasTkAgg, NavigationToolbar2Tk,
+        )
+
+        T  = self._theme.theme
+        lo = self._freq_lo
+        hi = self._freq_hi
+
+        top = tk.Toplevel()
+        top.title(f"Smith Chart \u2014 {lo:.4f}\u2013{hi:.4f} MHz")
+        top.configure(bg=T['bg_fig'])
+
+        # Use Figure directly (not plt.figure) so it is independent of the
+        # main pyplot state and does not interfere with the main window.
+        fig = Figure(figsize=(7, 7.5), facecolor=T['bg_fig'])
+        ax  = fig.add_axes([0.04, 0.06, 0.92, 0.90], aspect='equal')
+        ax.set_facecolor(T['bg_axes'])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlim(-1.15, 1.15)
+        ax.set_ylim(-1.15, 1.15)
+
+        self._draw_grid(ax, T)
+        traces = self._plot_traces(ax, T)
+
+        # Frequency-range legend below the chart
+        fig.text(
+            0.5, 0.015,
+            f"\u25cf  {lo:.4f} MHz     \u25a0  {hi:.4f} MHz",
+            ha='center', fontsize=9, fontweight='bold', color=T['fg_muted'],
+        )
+
+        canvas = FigureCanvasTkAgg(fig, master=top)
+        canvas.draw()
+
+        # Default save filename: file basenames + frequency range
+        _save_stem = (
+            "_".join(os.path.splitext(ds.label)[0] for ds in self._datasets)
+            + f"_smith_{lo:.4f}-{hi:.4f}MHz".replace('.', '_')
+        )
+        _cv = canvas
+        canvas.get_default_filename = (
+            lambda: _save_stem + '.' + _cv.get_default_filetype()
+        )
+
+        toolbar = NavigationToolbar2Tk(canvas, top, pack_toolbar=False)
+        toolbar.update()
+        # Raw Γ-coordinate readout is meaningless to users; the hover tooltip
+        # provides the useful information instead.
+        toolbar.set_message = lambda msg: None
+        for name in ('Back', 'Forward'):
+            if hasattr(toolbar, '_buttons') and name in toolbar._buttons:
+                toolbar._buttons[name].pack_forget()
+        toolbar.configure(bg=T['btn_base'])
+        toolbar.pack(side='bottom', fill='x')
+
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+        self._setup_hover(ax, canvas, T, traces)
+
+        top.lift()
+        top.focus_force()
+
+    # ── Grid drawing ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _arc_pts(
+        cx: float, cy: float, r: float, n: int = 1000
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Parametric circle clipped to the unit disk; outside points → NaN."""
+        theta   = np.linspace(0, 2 * np.pi, n)
+        px      = cx + r * np.cos(theta)
+        py      = cy + r * np.sin(theta)
+        outside = px ** 2 + py ** 2 > 1.0 + 1e-6
+        px[outside] = np.nan
+        py[outside] = np.nan
+        return px, py
+
+    def _draw_grid(self, ax, T) -> None:
+        """Draw constant-R circles, constant-X arcs, real axis, and labels."""
+        gc = T['grid_mj']
+        lc = T['band_label']
+        n  = self._N_PTS
+        t  = np.linspace(0, 2 * np.pi, n)
+
+        # Outer boundary (R = 0, unit circle)
+        ax.plot(np.cos(t), np.sin(t), color=T['fg'], lw=1.2, zorder=3)
+
+        # Real axis (X = 0 reference line)
+        ax.plot([-1.0, 1.0], [0.0, 0.0],
+                color=gc, lw=0.7, alpha=0.8, zorder=2)
+
+        # Constant-R circles
+        for rv in self._R_CIRCLES:
+            cx = rv / (rv + 1)
+            r  = 1.0 / (rv + 1)
+            px, py = self._arc_pts(cx, 0.0, r, n)
+            ax.plot(px, py, color=gc, lw=0.6, alpha=0.75, zorder=2)
+            # Label at the left intersection with the real axis
+            lx    = cx - r   # = (rv − 1) / (rv + 1)
+            label = str(int(rv)) if rv == int(rv) else str(rv)
+            ax.text(lx, 0.045, label, fontsize=8, fontweight='bold', color=lc,
+                    ha='center', va='bottom', zorder=4)
+
+        # Constant-X arcs (both positive and negative).
+        # Label position uses the analytical second intersection of each arc
+        # with the unit circle:  xi = (X²−1)/(X²+1),  yi = 2X/(X²+1).
+        # This spreads labels evenly around the rim instead of piling them up
+        # near Γ = 1 where all arcs also converge.
+        for xv in self._X_ARCS:
+            for sign in (+1, -1):
+                x  = sign * xv
+                r  = 1.0 / xv          # radius = 1 / |x|
+                cy = 1.0 / x           # centre y
+                px, py = self._arc_pts(1.0, cy, r, n)
+                ax.plot(px, py, color=gc, lw=0.6, alpha=0.75, zorder=2)
+
+                # Analytical rim intersection (not Γ=1), pushed 10% outside.
+                xi = (xv ** 2 - 1) / (xv ** 2 + 1)
+                yi = sign * 2 * xv    / (xv ** 2 + 1)
+                lx = xi * 1.10
+                ly = yi * 1.10
+                iv   = int(xv) if xv == int(xv) else xv
+                text = f"j{iv}" if sign > 0 else f"\u2212j{iv}"
+                ax.text(lx, ly, text, fontsize=8, fontweight='bold', color=lc,
+                        ha='center', va='center', zorder=4)
+
+        # Short-circuit (Γ = −1) and open-circuit (Γ = +1) labels
+        ax.text(-1.0, 0.06, "0",  fontsize=8, fontweight='bold', color=lc,
+                ha='center', va='bottom', zorder=4)
+        ax.text( 1.0, 0.06, "∞",  fontsize=8, fontweight='bold', color=lc,
+                ha='center', va='bottom', zorder=4)
+        ax.plot(0.0, 0.0, 'o', color=gc, ms=3, zorder=4)  # centre dot
+
+    # ── Data traces ───────────────────────────────────────────────────────────
+
+    def _plot_traces(self, ax, T) -> list[dict]:
+        """Convert R+jX → Γ, plot one curve per dataset, return trace records.
+
+        Each record in the returned list contains the Γ coordinates and the
+        corresponding frequency/SWR/impedance arrays needed for hover hit-testing.
+        """
+        Z0 = 50.0
+        traces = []
+        for i, ds in enumerate(self._datasets):
+            color = COLORS[i % len(COLORS)]
+            mask  = (ds.freqs >= self._freq_lo) & (ds.freqs <= self._freq_hi)
+            if not mask.any():
+                continue
+
+            z     = (ds.rs[mask] + 1j * ds.xs[mask]) / Z0
+            # Guard against z = −1 (open singularity; unphysical but possible
+            # when impedance data is clipped or corrupted).
+            denom = z + 1.0
+            safe  = np.abs(denom) > 1e-9
+            gamma = np.where(safe, (z - 1.0) / np.where(safe, denom, 1.0),
+                             np.nan + 0j)
+            gx    = gamma.real.astype(float)
+            gy    = gamma.imag.astype(float)
+
+            ax.plot(gx, gy, color=color, lw=1.8, zorder=5, label=ds.label)
+            # Circle at start (lowest frequency in range)
+            ax.plot(gx[0], gy[0], 'o', color=color, ms=6, zorder=6,
+                    markeredgecolor=T['marker_edge'], markeredgewidth=0.8)
+            # Square at end (highest frequency in range)
+            ax.plot(gx[-1], gy[-1], 's', color=color, ms=6, zorder=6,
+                    markeredgecolor=T['marker_edge'], markeredgewidth=0.8)
+
+            traces.append(dict(
+                gx=gx, gy=gy,
+                freqs=ds.freqs[mask], swrs=ds.swrs[mask],
+                rs=ds.rs[mask],       xs=ds.xs[mask],
+                color=color,
+            ))
+
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            leg = ax.legend(handles, labels, loc='lower right', fontsize=9,
+                            prop={'weight': 'bold'})
+            leg.get_frame().set_facecolor(T['leg_face'])
+            leg.get_frame().set_edgecolor(T['leg_edge'])
+            for txt in leg.get_texts():
+                txt.set_color(T['fg'])
+
+        return traces
+
+    # ── Hover tooltip ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _setup_hover(ax, canvas, T: dict, traces: list[dict]) -> None:
+        """Wire up a hover tooltip on the Smith Chart axes.
+
+        Finds the nearest Γ point across all traces (Euclidean distance in
+        Γ-space) and shows frequency, SWR, and impedance.  The annotation
+        border takes the colour of the nearest trace so the user can tell
+        which dataset is being reported.
+        """
+        _THRESHOLD = 0.05   # Γ-space snap radius (chart spans ±1.15)
+
+        ann = ax.annotate(
+            "", xy=(0, 0), xytext=(14, 14), textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.45", fc=T['hover_fc'],
+                      ec=T['hover_ec'], alpha=0.93, lw=1.2),
+            arrowprops=dict(arrowstyle="->", color=T['hover_arrow'], lw=0.9),
+            fontsize=9, zorder=12, visible=False, color=T['hover_fg'],
+        )
+
+        def _on_move(event) -> None:
+            if event.inaxes is not ax or event.xdata is None:
+                if ann.get_visible():
+                    ann.set_visible(False)
+                    canvas.draw_idle()
+                return
+
+            mx, my = event.xdata, event.ydata
+            best_dist, best_tr, best_idx = float('inf'), None, 0
+
+            for tr in traces:
+                dx   = tr['gx'] - mx
+                dy   = tr['gy'] - my
+                dist = np.hypot(dx, dy)
+                if not np.isfinite(dist).any():
+                    continue
+                idx = int(np.nanargmin(dist))
+                if dist[idx] < best_dist:
+                    best_dist = dist[idx]
+                    best_tr   = tr
+                    best_idx  = idx
+
+            if best_tr is None or best_dist > _THRESHOLD:
+                if ann.get_visible():
+                    ann.set_visible(False)
+                    canvas.draw_idle()
+                return
+
+            fx    = float(best_tr['freqs'][best_idx])
+            sy    = float(best_tr['swrs'][best_idx])
+            rv    = float(best_tr['rs'][best_idx])
+            xv    = float(best_tr['xs'][best_idx])
+            swr_s = f">{SWR_CAP}" if sy >= SWR_CAP else f"{sy:.2f}"
+            sign  = '+' if xv >= 0 else ''
+            clip  = "  (clipped)" if abs(rv) >= IMP_CAP or abs(xv) >= IMP_CAP else ""
+            text  = (f"{fx:.4f} MHz{band_of(fx)}\n"
+                     f"SWR {swr_s}\n"
+                     f"Z = {rv:.1f}{sign}{xv:.1f}j \u03a9{clip}")
+
+            gxi = float(best_tr['gx'][best_idx])
+            gyi = float(best_tr['gy'][best_idx])
+            # Flip to the left when near the right half of the chart
+            offset = (-130, 14) if gxi > 0.3 else (14, 14)
+            ann.xy = (gxi, gyi)
+            ann.set_text(text)
+            ann.set_position(offset)
+            ann.get_bbox_patch().set_edgecolor(best_tr['color'])
+            ann.set_visible(True)
+            canvas.draw_idle()
+
+        def _on_leave(event) -> None:
+            if ann.get_visible():
+                ann.set_visible(False)
+                canvas.draw_idle()
+
+        canvas.mpl_connect('motion_notify_event', _on_move)
+        canvas.mpl_connect('axes_leave_event',    _on_leave)
 
 
 # ── SWRApp ────────────────────────────────────────────────────────────────────
@@ -934,6 +1351,9 @@ class SWRApp:
         self._band_row: BandButtonRow        = None
         self._popup: MinSWRPopup             = None
         self._clamping_xlim: bool            = False  # recursion guard for xlim clamp
+        self._imp_visible: bool              = True
+        self._tk_imp_btn                     = None
+        self._tk_imp_tip: Tooltip | None     = None
 
         self._create_figure()
         self._plot_data()
@@ -956,6 +1376,14 @@ class SWRApp:
         win_title  = "SWR Chart: " + "  ".join(ds.label for ds in self._datasets)
         self._fig  = plt.figure(win_title, figsize=(15, 9))
         self._fig.patch.set_facecolor(self._theme.theme['bg_fig'])
+        # Override the save-dialog default filename to use clean basenames (no extension).
+        # canvas.get_default_filename() uses the window title in modern matplotlib, so we
+        # replace it on the instance to return the desired name instead.
+        _save_stem = "_".join(os.path.splitext(ds.label)[0] for ds in self._datasets)
+        _canvas    = self._fig.canvas
+        self._fig.canvas.get_default_filename = (
+            lambda: _save_stem + '.' + _canvas.get_default_filetype()
+        )
 
         self._try_set_icon()
 
@@ -1191,18 +1619,39 @@ class SWRApp:
             if hasattr(toolbar, '_buttons') and name in toolbar._buttons:
                 toolbar._buttons[name].pack_forget()
 
+        sep0 = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
+        sep0.pack(side='left', fill='y', padx=6, pady=3)
+
+        # Theme toggle: icon button placed directly after the Save button.
+        # ThemeManager.apply() will set the correct image on the first theme pass.
+        _bulb_init = _make_bulb_photo(False, T0['btn_fg'], T0['btn_base'])
+        tk_toggle = tk.Button(
+            toolbar,
+            image=_bulb_init,
+            command=self._theme.toggle,
+            relief='raised', bd=2,
+            bg=T0['btn_base'],
+            activebackground=T0['btn_hover'],
+            padx=4, pady=4,
+        )
+        tk_toggle._bulb_img = _bulb_init   # prevent garbage collection
+        tk_toggle.pack(side='left', padx=2, pady=3)
+        Tooltip(tk_toggle, 'Toggle dark / light theme')
+
         sep1 = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
         sep1.pack(side='left', fill='y', padx=6, pady=3)
 
-        tk_toggle = tk.Button(
-            toolbar, text=T0['toggle_label'],
-            command=self._theme.toggle,
+        tk_imp_btn = tk.Button(
+            toolbar, text='Impedance \u25bc',
+            command=self._toggle_impedance,
             relief='raised', bd=2,
             bg=T0['btn_base'], fg=T0['btn_fg'],
             activebackground=T0['btn_hover'], activeforeground=T0['btn_fg'],
             font=('TkDefaultFont', 9, 'bold'), padx=10, pady=1,
         )
-        tk_toggle.pack(side='left', padx=2, pady=3)
+        tk_imp_btn.pack(side='left', padx=2, pady=3)
+        self._tk_imp_btn = tk_imp_btn
+        self._tk_imp_tip = Tooltip(tk_imp_btn, 'Hide the impedance panel (SWR plot expands)')
 
         sep2 = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
         sep2.pack(side='left', fill='y', padx=6, pady=3)
@@ -1216,8 +1665,47 @@ class SWRApp:
             font=('TkDefaultFont', 9, 'bold'), padx=10, pady=1,
         )
         tk_mswr.pack(side='left', padx=2, pady=3)
+        Tooltip(tk_mswr, 'Compare best SWR in each band across all loaded files')
 
-        self._theme.register_tk_buttons(tk_toggle, tk_mswr)
+        sep3 = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
+        sep3.pack(side='left', fill='y', padx=6, pady=3)
+
+        tk_smith = tk.Button(
+            toolbar, text='Smith Chart',
+            command=self._open_smith_chart,
+            relief='raised', bd=2,
+            bg=T0['btn_base'], fg=T0['btn_fg'],
+            activebackground=T0['btn_hover'], activeforeground=T0['btn_fg'],
+            font=('TkDefaultFont', 9, 'bold'), padx=10, pady=1,
+        )
+        tk_smith.pack(side='left', padx=2, pady=3)
+        Tooltip(tk_smith, 'Open a Smith Chart for the current frequency range')
+
+        self._theme.register_tk_buttons(tk_toggle, tk_imp_btn, tk_mswr, tk_smith)
+
+    def _open_smith_chart(self) -> None:
+        """Open a new Smith Chart popup for the current visible frequency range."""
+        lo, hi = self._ax_swr.get_xlim()
+        SmithChartPopup(self._datasets, self._theme, lo, hi).show()
+
+    def _toggle_impedance(self) -> None:
+        """Show or hide the impedance panel, expanding the SWR plot to fill."""
+        self._imp_visible = not self._imp_visible
+        if self._imp_visible:
+            self._ax_swr.set_position([0.07, 0.50, 0.91, 0.40])
+            self._ax_imp.set_visible(True)
+            self._ax_swr.set_xlabel('')
+            self._ax_imp.set_xlabel('Frequency (MHz)', fontsize=10)
+            self._tk_imp_btn.configure(text='Impedance \u25bc')
+            self._tk_imp_tip.update_text('Hide the impedance panel (SWR plot expands)')
+        else:
+            self._ax_swr.set_position([0.07, 0.08, 0.91, 0.82])
+            self._ax_imp.set_visible(False)
+            self._ax_imp.set_xlabel('')
+            self._ax_swr.set_xlabel('Frequency (MHz)', fontsize=10)
+            self._tk_imp_btn.configure(text='Impedance \u25b2')
+            self._tk_imp_tip.update_text('Show the impedance panel')
+        self._fig.canvas.draw_idle()
 
     # ── Adaptive tick callbacks ────────────────────────────────────────────────
 
