@@ -1,25 +1,24 @@
 # swr_explore.py — NanoVNA SWR & Impedance Analyzer
 
-An interactive viewer for NanoVNA `.s1p` (Touchstone) measurement files.
+An interactive viewer for NanoVNA (or other)`.s1p`(Touchstone) measurement files.
 Load one or more files and explore SWR and impedance across all HF and VHF/UHF ham bands included in any of the .s1p files.
-
 ---
 
 ## Features at a Glance
 
-- **Dual-panel display** — SWR on top, impedance (R and X) on the bottom, sharing a common frequency axis
 - **Multi-file overlay** — load several `.s1p` files at once to compare antennas, feed lines, or balun configurations side by side
+- **Dual-panel display** — SWR on top, impedance (R and X) on the bottom, sharing a common frequency axis
+- **Min SWR popup** — a table comparing the best SWR in every band across all loaded files, with the winner in each band highlighted and marked with a blue ★
+- **Smith Chart popup** — open a Smith Chart for the currently visible frequency range; multiple windows can be open simultaneously
 - **Band shading** — each ham band is highlighted with a distinct color; band names are labeled at the top of the SWR plot
+- **Band zoom buttons** — one-click zoom to any band. Buttons appear only for bands present in the loaded files
+- **Impedance panel toggle** — hide the lower impedance panel so the SWR plot expands to fill the window; click again to restore it
 - **SWR reference lines** — dashed guidelines at 1.5:1, 2:1, and 3:1 for quick visual assessment
 - **Band minima markers** — a dot and SWR value are printed at the best (lowest) SWR point within each band for every file
 - **Hover tooltip** — move the mouse over either plot to see exact frequency, SWR, and impedance (R + jX)
 - **Pinned tooltips** — left-click to lock a tooltip in place; click the same spot again to remove it
-- **Band zoom buttons** — one-click zoom to any band. Buttons appear only for bands present in the loaded files
 - **Scroll-wheel zoom** — zoom in/out on the frequency axis, centered on the cursor position
 - **Adaptive tick marks** — both X and Y tick spacing automatically adjust as you zoom in or out, so there are always readable numbers at any zoom level
-- **Min SWR popup** — a table comparing the best SWR in every band across all loaded files, with the winner in each band highlighted and marked with a blue ★
-- **Smith Chart popup** — open a Smith Chart for the currently visible frequency range; multiple windows can be open simultaneously
-- **Impedance panel toggle** — hide the lower impedance panel so the SWR plot expands to fill the window; click again to restore it
 - **Dark / Light theme toggle** — switch between a dark and light colour theme at any time using the light-bulb icon in the toolbar
 - **Save figure** — the standard toolbar Save button saves to the current directory (not home)
 
