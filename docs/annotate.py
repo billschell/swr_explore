@@ -13,40 +13,49 @@ DST   = os.path.join(HERE, 'window_layout_annotated.png')
 FONT_REG  = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
 FONT_BOLD = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
 
-# ── Image dimensions: 1499 × 978 ─────────────────────────────────────────────
+# ── Image dimensions: 1496 × 985 ─────────────────────────────────────────────
 #
 #  Coordinate notes (light-theme screenshot):
-#  Button row:  y ≈ 35–78   (band buttons only — All, 40m … 10m)
-#  SWR plot:    x ≈ 77–1345,  y ≈ 100–455
-#  Imp plot:    x ≈ 77–1345,  y ≈ 475–840
-#  Toolbar:     y ≈ 930–978   (Home/Pan/Zoom/Save | Dark | Minimum SWR by band)
+#  Button row:  y ≈ 42–80    (band buttons — All, 40m … 10m)
+#  SWR plot:    x ≈ 77–1430,  y ≈ 110–468
+#  Imp plot:    x ≈ 77–1430,  y ≈ 480–858
+#  Toolbar:     y ≈ 944–985
+#    x ≈  80  Matplotlib icons (home/pan/zoom/save)
+#    x ≈ 185  Theme toggle (light-bulb icon)       ← right of Save
+#    x ≈ 270  Impedance panel toggle
+#    x ≈ 420  Minimum SWR by band popup
+#    x ≈ 560  Smith Chart popup
 
 # ── Callouts: (dot_x, dot_y, number, description) ────────────────────────────
 CALLOUTS = [
     # ── top button row ──────────────────────────────────────────────────────
-    ( 490,  57,  1, "Band zoom buttons  (All, 40 m … 10 m)"),
+    ( 490,  62,  1, "Band zoom buttons  (All, 40 m … 10 m)"),
 
     # ── SWR plot ─────────────────────────────────────────────────────────────
     ( 175, 310,  2, "SWR data curve  (one per loaded file)"),
     ( 163, 118,  3, "Ham-band label & colour shading"),
-    ( 490, 440,  4, "Band-minimum SWR marker  (dot + value)"),
+    ( 490, 452,  4, "Band-minimum SWR marker  (dot + value)"),
     ( 700, 443,  5, "Reference lines  (SWR 1.5 : 1 / 2 : 1 / 3 : 1)"),
-    (1340, 133,  6, "SWR plot legend"),
+    (1290, 133,  6, "SWR plot legend"),
 
     # ── Impedance plot ───────────────────────────────────────────────────────
-    ( 290, 595,  7, "R — resistance  (solid line, Ω)"),
+    ( 290, 590,  7, "R — resistance  (solid line, Ω)"),
     ( 260, 730,  8, "X — reactance  (dashed line, Ω)"),
-    ( 700, 660,  9, "Zero-impedance reference line"),
-    (1340, 505, 10, "Impedance plot legend"),
 
     # ── toolbar ──────────────────────────────────────────────────────────────
-    (  85, 950, 11, "Matplotlib toolbar  (pan / zoom / save)"),
-    ( 193, 950, 12, "Dark / Light theme toggle button"),
-    ( 313, 950, 13, "Minimum SWR by band popup button"),
+    (  80, 965,  9, "Matplotlib toolbar  (home / pan / zoom / save)"),
+    ( 185, 965, 10, "Theme toggle  (light-bulb icon)"),
+    ( 270, 965, 11, "Impedance panel toggle"),
+    ( 420, 965, 12, "Minimum SWR by band popup"),
+    ( 560, 965, 13, "Smith Chart popup"),
+
+    # ── Impedance plot (continued) ───────────────────────────────────────────
+    ( 700, 640, 14, "Zero-impedance reference line"),
+    (1290, 505, 15, "Impedance plot legend"),
 ]
 
 # ── Layout constants ──────────────────────────────────────────────────────────
-KEY_H       = 340     # pixels added at the bottom for the key strip
+KEY_H       = 400     # pixels added at the bottom for the key strip
 CR          = 14      # callout circle radius (slightly larger for readability)
 CIRC_FILL   = (90, 20, 140)
 CIRC_BORDER = (255, 255, 255)
@@ -111,8 +120,8 @@ for dot_x, dot_y, num, _ in CALLOUTS:
 # ── Key strip ─────────────────────────────────────────────────────────────────
 draw.text((COL1_X, H + 8), "Key:", fill='#333333', font=f_title)
 
-col1 = [(n, d) for _, _, n, d in CALLOUTS if n <= 6]
-col2 = [(n, d) for _, _, n, d in CALLOUTS if n >  6]
+col1 = [(n, d) for _, _, n, d in CALLOUTS if n <= 8]
+col2 = [(n, d) for _, _, n, d in CALLOUTS if n >  8]
 
 y1 = H + 32
 for num, desc in col1:
