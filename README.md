@@ -18,7 +18,9 @@ Load one or more files and explore SWR and impedance across all HF and VHF/UHF h
 - **Scroll-wheel zoom** — zoom in/out on the frequency axis, centered on the cursor position
 - **Adaptive tick marks** — both X and Y tick spacing automatically adjust as you zoom in or out, so there are always readable numbers at any zoom level
 - **Min SWR popup** — a table comparing the best SWR in every band across all loaded files, with the winner in each band highlighted and marked with a blue ★
-- **Dark / Light theme toggle** — switch between a dark and light colour theme at any time using the button in the toolbar
+- **Smith Chart popup** — open a Smith Chart for the currently visible frequency range; multiple windows can be open simultaneously
+- **Impedance panel toggle** — hide the lower impedance panel so the SWR plot expands to fill the window; click again to restore it
+- **Dark / Light theme toggle** — switch between a dark and light colour theme at any time using the light-bulb icon in the toolbar
 - **Save figure** — the standard toolbar Save button saves to the current directory (not home)
 
 ---
@@ -59,7 +61,7 @@ python3 swr_explore.py config_a.s1p config_b.s1p config_c.s1p
 ![Annotated window layout](docs/window_layout_annotated.png)
 
 The title bar shows the names of all loaded files separated by `vs`.
-Numbered callouts in the image correspond to the key at the bottom of the image
+Numbered callouts (1–15) in the image correspond to the key at the bottom of the image
 and are described in detail in the sections below.
 
 ---
@@ -69,7 +71,6 @@ and are described in detail in the sections below.
 - **All** — zooms out to show all bands included in any .s1p file
 - **40m … 10m** — zooms to that band with padding on each side; buttons only appear for bands that have data
 - Any band button also **auto-scales both Y axes** to fit the actual data within that frequency range, so weak features are not hidden by the full-range scale
-- **Min SWR** (bold blue) — opens the [Min SWR popup](#the-min-swr-popup)
 
 ---
 
@@ -134,7 +135,7 @@ The toolbar **Home button** (⌂) clears all pins and resets the zoom simultaneo
 
 ## The Min SWR Popup
 
-Click **Min SWR** in the button row to open a comparison table:
+Click **Minimum SWR by band** in the toolbar to open a comparison table:
 ![Min SWR popup](docs/min_swr.png)
 
 - Each row is one ham band; each column is one loaded file
@@ -142,16 +143,45 @@ Click **Min SWR** in the button row to open a comparison table:
 - Each cell shows the minimum SWR and the frequency where it occurs
 - The cell with the **lowest SWR in each row** is highlighted green with a blue ★ to the right of the value
 - The popup matches the current dark or light theme
-- Clicking **Min SWR** again closes the old window and opens a fresh one
+- Clicking **Minimum SWR by band** again closes the old window and opens a fresh one
+
+---
+
+## The Smith Chart Popup
+
+Click **Smith Chart** in the toolbar to open a Smith Chart for the currently visible frequency range.
+
+![Smith Chart popup](docs/smith_chart.png)
+
+- The chart shows the antenna impedance trace plotted as a reflection coefficient (Γ) on the standard normalised Smith Chart grid
+- One trace is drawn per loaded file, in the same colours used in the main plots
+- A **circle (●)** marks the lowest frequency in the visible range; a **square (■)** marks the highest
+- The frequency range captured is shown below the chart
+- Grid lines show constant-resistance circles (labelled 0.2, 0.5, 1, 2, 5) and constant-reactance arcs (labelled ±j0.2 through ±j5)
+- **0** (left edge) = short circuit; **∞** (right edge) = open circuit; centre = perfect 50 Ω match
+- **Hover tooltip** — move the mouse over the chart to see the frequency, SWR, and impedance (R + jX) at the nearest point on any trace
+- Clicking **Smith Chart** again opens a **second independent window** — the previous one stays open. Each window captures the zoom level at the moment it was opened, so you can compare the same antenna across different frequency ranges side by side
+
+### Reading the chart
+
+| Position | What it means |
+|---|---|
+| Near the centre | Impedance close to 50 Ω — excellent match, low SWR |
+| Near the outer rim | High SWR — large mismatch |
+| Right half (positive X arc side) | Inductive reactance |
+| Left half (negative X arc side) | Capacitive reactance |
+| Crossing the real axis | Resonance — reactance passes through zero |
+| Tight cluster | Narrow frequency range, impedance barely changing |
+| Large loop | Wide impedance swing across the frequency range |
 
 ---
 
 ## Dark / Light Theme
 
-Click the **Dark** or **Light** button in the toolbar (next to the Save button) to toggle the colour theme at any time. The label shows what clicking it will switch *to*:
+Click the **light-bulb icon** in the toolbar (immediately after the Save button) to toggle the colour theme at any time:
 
-- **Dark** — switch to the dark theme (dark grey backgrounds, vibrant curves, deep band shading)
-- **Light** — switch back to the light theme (white backgrounds, pastel band shading)
+- **Unlit bulb (outline)** — currently in light theme; click to switch to dark
+- **Lit bulb (filled)** — currently in dark theme; click to switch to light
 
 Everything updates instantly — plots, buttons, legends, tooltips, and the Min SWR popup all reflect the active theme.
 
@@ -168,8 +198,11 @@ Everything updates instantly — plots, buttons, legends, tooltips, and the Min 
 | **Toolbar ✛ (Pan)** | Click and drag to pan |
 | **Toolbar 🔍 (Zoom)** | Rectangle zoom (drag to select) |
 | **Toolbar ⌂ (Home)** | Reset zoom and clear all pinned tooltips |
-| **Toolbar 💾 (Save)** | Save figure to the current directory |
-| **Toolbar Dark/Light** | Toggle colour theme |
+| **Toolbar 💾 (Save)** | Save figure to the current directory; default filename is built from the loaded file names |
+| **Toolbar 💡 (bulb icon)** | Toggle colour theme between light and dark |
+| **Toolbar Impedance ▼/▲** | Hide or show the lower impedance panel; the SWR plot expands to fill when hidden |
+| **Toolbar Minimum SWR by band** | Open the per-band minimum SWR comparison table |
+| **Toolbar Smith Chart** | Open a Smith Chart for the visible frequency range |
 
 Tick marks on both axes adapt automatically as you zoom — major and minor ticks
 become finer when zoomed in and coarser when zoomed out, so there are always
