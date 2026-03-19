@@ -364,18 +364,22 @@ def band_of(fx: float) -> str:
     return ""
 
 
-def _format_tip(ds: S1PDataset, idx: int) -> str:
-    """Format the hover/pin tooltip text for dataset *ds* at sample *idx*."""
-    fx      = float(ds.freqs[idx])
-    sy      = float(ds.swrs[idx])
-    Rv      = float(ds.rs[idx])
-    Xv      = float(ds.xs[idx])
+def _format_tip_values(fx: float, sy: float, rv: float, xv: float) -> str:
+    """Format tooltip text from raw frequency/SWR/impedance values."""
     swr_s   = f">{SWR_CAP}" if sy >= SWR_CAP else f"{sy:.2f}"
-    sign    = '+' if Xv >= 0 else ''
-    clipped = "  (clipped)" if abs(Rv) >= IMP_CAP or abs(Xv) >= IMP_CAP else ""
+    sign    = '+' if xv >= 0 else ''
+    clipped = "  (clipped)" if abs(rv) >= IMP_CAP or abs(xv) >= IMP_CAP else ""
     return (f"{fx:.4f} MHz{band_of(fx)}\n"
             f"SWR {swr_s}\n"
-            f"Z = {Rv:.1f}{sign}{Xv:.1f}j Ω{clipped}")
+            f"Z = {rv:.1f}{sign}{xv:.1f}j Ω{clipped}")
+
+
+def _format_tip(ds: S1PDataset, idx: int) -> str:
+    """Format the hover/pin tooltip text for dataset *ds* at sample *idx*."""
+    return _format_tip_values(
+        float(ds.freqs[idx]), float(ds.swrs[idx]),
+        float(ds.rs[idx]),    float(ds.xs[idx]),
+    )
 
 
 # ── ThemeManager ──────────────────────────────────────────────────────────────
@@ -390,21 +394,21 @@ class ThemeManager:
     """
 
     def __init__(self, initial: str = 'light') -> None:
-        self._current: str = initial
-        self._fig = None
-        self._ax_swr = None
-        self._ax_imp = None
-        self._band_patches: list = []
-        self._ref_lines: list    = []
-        self._zero_line          = None
-        self._band_labels: list  = []
-        self._legs: list         = []
-        self._title_text         = None
-        self._dot_artists: list  = []
-        self._btn_data: list     = []
-        self._tk_toggle          = None   # special: also gets label text updated
-        self._tk_buttons: list   = []     # all themed toolbar buttons
-        self._hover_ann          = None
+        self._current: str                = initial
+        self._fig: Figure | None          = None
+        self._ax_swr: Axes | None         = None
+        self._ax_imp: Axes | None         = None
+        self._band_patches: list[tuple]   = []
+        self._ref_lines: list[Line2D]     = []
+        self._zero_line: Line2D | None    = None
+        self._band_labels: list           = []
+        self._legs: list                  = []
+        self._title_text                  = None
+        self._dot_artists: list[Line2D]   = []
+        self._btn_data: list[dict]        = []
+        self._tk_toggle                   = None   # special: also gets label text updated
+        self._tk_buttons: list            = []     # all themed toolbar buttons
+        self._hover_ann                   = None
 
     # ── Registration ──────────────────────────────────────────────────────────
 
@@ -494,11 +498,10 @@ class ThemeManager:
             ax.grid(True, which='minor',
                     color=T['grid_mn'], alpha=T['grid_mn_a'], ls=':', zorder=0)
 
-        for i, (sp_swr, sp_imp) in enumerate(self._band_patches):
-            sp_swr.set_facecolor(bc[i])
-            sp_swr.set_alpha(T['band_alpha'])
-            sp_imp.set_facecolor(bc[i])
-            sp_imp.set_alpha(T['band_alpha'])
+        for (sp_swr, sp_imp), color in zip(self._band_patches, bc):
+            for sp in (sp_swr, sp_imp):
+                sp.set_facecolor(color)
+                sp.set_alpha(T['band_alpha'])
 
         for line, color in zip(self._ref_lines, T['ref_colors']):
             line.set_color(color)
@@ -767,24 +770,25 @@ class BandButtonRow:
             [(self._view_lo, self._view_hi)]
             + [
                 (
-                    max(b[1] - min((b[2] - b[1]) * 2, 0.5), self._view_lo),
-                    min(b[2] + min((b[2] - b[1]) * 2, 0.5), self._view_hi),
+                    max(b[1] - (b[2] - b[1]) / 18, self._view_lo),
+                    min(b[2] + (b[2] - b[1]) / 18, self._view_hi),
                 )
                 for b in self._active_bands
             ]
         )
 
-        n     = len(btn_labels)
-        bh    = 0.030
-        by    = 0.955
-        gap   = 0.004
-        bw    = (0.94 - (n - 1) * gap) / n
-        bw    = max(0.035, min(bw, 0.091))
-        total = n * bw + (n - 1) * gap
-        bx0   = (1.0 - total) / 2.0
+        n          = len(btn_labels)
+        btn_h      = 0.030          # button height in figure-fraction units
+        row_y      = 0.955          # bottom of the button row
+        gap        = 0.004          # gap between buttons
+        usable_w   = 0.94           # total width available for all buttons
+        btn_w      = (usable_w - (n - 1) * gap) / n
+        btn_w      = max(0.035, min(btn_w, 0.091))   # clamp to readable range
+        row_w      = n * btn_w + (n - 1) * gap
+        row_left   = (1.0 - row_w) / 2.0             # centre the row
 
         for j, (lbl, (rlo, rhi)) in enumerate(zip(btn_labels, btn_ranges)):
-            ax_b = self._fig.add_axes([bx0 + j * (bw + gap), by, bw, bh])
+            ax_b = self._fig.add_axes([row_left + j * (btn_w + gap), row_y, btn_w, btn_h])
             b    = Button(ax_b, lbl, color=T['btn_base'],
                           hovercolor=T['btn_hover'])
             b.label.set_fontsize(9)
@@ -1260,16 +1264,11 @@ class SmithChartPopup:
                     canvas.draw_idle()
                 return
 
-            fx    = float(best_tr['freqs'][best_idx])
-            sy    = float(best_tr['swrs'][best_idx])
-            rv    = float(best_tr['rs'][best_idx])
-            xv    = float(best_tr['xs'][best_idx])
-            swr_s = f">{SWR_CAP}" if sy >= SWR_CAP else f"{sy:.2f}"
-            sign  = '+' if xv >= 0 else ''
-            clip  = "  (clipped)" if abs(rv) >= IMP_CAP or abs(xv) >= IMP_CAP else ""
-            text  = (f"{fx:.4f} MHz{band_of(fx)}\n"
-                     f"SWR {swr_s}\n"
-                     f"Z = {rv:.1f}{sign}{xv:.1f}j \u03a9{clip}")
+            fx   = float(best_tr['freqs'][best_idx])
+            sy   = float(best_tr['swrs'][best_idx])
+            rv   = float(best_tr['rs'][best_idx])
+            xv   = float(best_tr['xs'][best_idx])
+            text = _format_tip_values(fx, sy, rv, xv)
 
             gxi = float(best_tr['gx'][best_idx])
             gyi = float(best_tr['gy'][best_idx])
@@ -1619,8 +1618,7 @@ class SWRApp:
             if hasattr(toolbar, '_buttons') and name in toolbar._buttons:
                 toolbar._buttons[name].pack_forget()
 
-        sep0 = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
-        sep0.pack(side='left', fill='y', padx=6, pady=3)
+        self._add_separator(toolbar)
 
         # Theme toggle: icon button placed directly after the Save button.
         # ThemeManager.apply() will set the correct image on the first theme pass.
@@ -1638,50 +1636,53 @@ class SWRApp:
         tk_toggle.pack(side='left', padx=2, pady=3)
         Tooltip(tk_toggle, 'Toggle dark / light theme')
 
-        sep1 = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
-        sep1.pack(side='left', fill='y', padx=6, pady=3)
-
-        tk_imp_btn = tk.Button(
-            toolbar, text='Impedance \u25bc',
-            command=self._toggle_impedance,
-            relief='raised', bd=2,
-            bg=T0['btn_base'], fg=T0['btn_fg'],
-            activebackground=T0['btn_hover'], activeforeground=T0['btn_fg'],
-            font=('TkDefaultFont', 9, 'bold'), padx=10, pady=1,
+        self._add_separator(toolbar)
+        tk_imp_btn = self._make_toolbar_button(
+            toolbar, 'Impedance \u25bc', self._toggle_impedance,
+            'Hide the impedance panel (SWR plot expands)',
         )
-        tk_imp_btn.pack(side='left', padx=2, pady=3)
         self._tk_imp_btn = tk_imp_btn
-        self._tk_imp_tip = Tooltip(tk_imp_btn, 'Hide the impedance panel (SWR plot expands)')
+        self._tk_imp_tip = tk_imp_btn.tooltip   # updated by _toggle_impedance
 
-        sep2 = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
-        sep2.pack(side='left', fill='y', padx=6, pady=3)
-
-        tk_mswr = tk.Button(
-            toolbar, text='Minimum SWR by band',
-            command=self._popup.show,
-            relief='raised', bd=2,
-            bg=T0['btn_base'], fg=T0['btn_fg'],
-            activebackground=T0['btn_hover'], activeforeground=T0['btn_fg'],
-            font=('TkDefaultFont', 9, 'bold'), padx=10, pady=1,
+        self._add_separator(toolbar)
+        tk_mswr = self._make_toolbar_button(
+            toolbar, 'Minimum SWR by band', self._popup.show,
+            'Compare best SWR in each band across all loaded files',
         )
-        tk_mswr.pack(side='left', padx=2, pady=3)
-        Tooltip(tk_mswr, 'Compare best SWR in each band across all loaded files')
 
-        sep3 = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
-        sep3.pack(side='left', fill='y', padx=6, pady=3)
-
-        tk_smith = tk.Button(
-            toolbar, text='Smith Chart',
-            command=self._open_smith_chart,
-            relief='raised', bd=2,
-            bg=T0['btn_base'], fg=T0['btn_fg'],
-            activebackground=T0['btn_hover'], activeforeground=T0['btn_fg'],
-            font=('TkDefaultFont', 9, 'bold'), padx=10, pady=1,
+        self._add_separator(toolbar)
+        tk_smith = self._make_toolbar_button(
+            toolbar, 'Smith Chart', self._open_smith_chart,
+            'Open a Smith Chart for the current frequency range',
         )
-        tk_smith.pack(side='left', padx=2, pady=3)
-        Tooltip(tk_smith, 'Open a Smith Chart for the current frequency range')
 
         self._theme.register_tk_buttons(tk_toggle, tk_imp_btn, tk_mswr, tk_smith)
+
+    @staticmethod
+    def _add_separator(toolbar) -> None:
+        """Insert a thin vertical separator bar into the Tk toolbar."""
+        import tkinter as tk
+        sep = tk.Frame(toolbar, width=2, bd=1, relief='sunken')
+        sep.pack(side='left', fill='y', padx=6, pady=3)
+
+    def _make_toolbar_button(self, toolbar, text: str, command, tooltip: str):
+        """Create a styled text button, pack it, attach a tooltip, and return it.
+
+        The ``Tooltip`` instance is stored on the button as ``btn.tooltip`` so
+        callers that need to update the tooltip text later can do so.
+        """
+        import tkinter as tk
+        T = self._theme.theme
+        btn = tk.Button(
+            toolbar, text=text, command=command,
+            relief='raised', bd=2,
+            bg=T['btn_base'], fg=T['btn_fg'],
+            activebackground=T['btn_hover'], activeforeground=T['btn_fg'],
+            font=('TkDefaultFont', 9, 'bold'), padx=10, pady=1,
+        )
+        btn.pack(side='left', padx=2, pady=3)
+        btn.tooltip = Tooltip(btn, tooltip)
+        return btn
 
     def _open_smith_chart(self) -> None:
         """Open a new Smith Chart popup for the current visible frequency range."""
