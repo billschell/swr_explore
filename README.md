@@ -27,7 +27,7 @@ Load one or more files and explore SWR and impedance across all HF and VHF/UHF h
 #### The example figures below are from a doublet antenna, where the .s1p files are:
 - `antenna1.s1p` — NanoVNA connected to a 1:1 balun (no tuner) to 300 Ω window line
 - `antenna2.s1p` — NanoVNA connected through MFJ-993B tuner to 300 Ω window line (tuner off). Tuner has built-in 4:1 balun for the window line
-#### <u>These files are present in the resources directory if you want to play with the tool and you dont have any .s1p files handy</u>
+#### <span style="color: red;">These files are present in the resources directory if you want to play with the tool and you dont have any .s1p files handy</span>
 
 ## Usage
 
