@@ -1,7 +1,7 @@
 # swr_explore.py — NanoVNA SWR & Impedance Analyzer
 
 An interactive viewer for NanoVNA (or other)`.s1p`(Touchstone) measurement files.
-Load one or more files and explore SWR and impedance across all HF and VHF/UHF ham bands included in any of the .s1p files.
+Loads one or more files and allows comparison of SWR and impedance across all HF and VHF/UHF ham bands included in any of the .s1p files.
 ---
 
 ## Features at a Glance
